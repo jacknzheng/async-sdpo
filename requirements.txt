@@ -1,0 +1,20 @@
+# Python 3.11 or 3.12. NOT 3.13+ -- torch and vLLM don't support it yet.
+
+# --- core training (CPU-installable; the whole test suite runs on these) ---
+torch>=2.4
+transformers>=4.45
+datasets>=3.0
+pytest>=8.0
+
+# --- rubric judge (eval only, never in the gradient) ---
+# Served by OpenRouter over its OpenAI-compatible /chat/completions endpoint, called with
+# plain requests -- one POST is the whole surface, so no vendor SDK. Needs
+# OPENROUTER_API_KEY in the environment.
+rubric==2.2.0
+requests>=2.32
+python-dotenv>=1.0   # run.py loads OPENROUTER_API_KEY from .env
+
+# --- rollout engine (GPU only; omit on a dev laptop) ---
+# PIN EXACTLY. train/rollout.py uses the native weight-transfer API
+# (vllm.distributed.weight_transfer), which does NOT exist before 0.26.
+# vllm==0.26.0

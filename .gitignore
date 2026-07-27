@@ -1,0 +1,17 @@
+# Secrets -- .env holds OPENROUTER_API_KEY for the judge. Never commit it.
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Run outputs (checkpoints, logs)
+runs/
+
+# macOS
+.DS_Store
+
+# Local editor/agent state
+.claude/settings.local.json
