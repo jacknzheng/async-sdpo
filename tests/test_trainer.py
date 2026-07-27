@@ -183,6 +183,24 @@ def test_checkpoint_roundtrip_preserves_ema_and_step():
     assert restored.state.clipper.step == trainer.state.clipper.step
 
 
+def test_save_checkpoint_writes_loadable_state(tmp_path):
+    """run.py's checkpoint file must round-trip through load_state_dict -- weights, step,
+    and the EMA clipper. A RunPod interruption is survivable only if this works."""
+    from run import save_checkpoint
+
+    trainer = _trainer()
+    trainer.train_step([_traj(), _traj(task_id="2")])
+    save_checkpoint(trainer, str(tmp_path), 7)
+
+    restored = _trainer()
+    restored.load_state_dict(torch.load(tmp_path / "step_7" / "state.pt"))
+
+    assert restored.state.step == trainer.state.step
+    assert restored.state.clipper.ema == trainer.state.clipper.ema
+    for a, b in zip(restored.model.parameters(), trainer.model.parameters()):
+        torch.testing.assert_close(a, b)
+
+
 def test_trainer_state_roundtrip():
     state = TrainerState()
     state.step = 7

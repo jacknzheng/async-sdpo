@@ -28,6 +28,7 @@ training will not move regardless of how healthy the loss curve looks.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -86,6 +87,14 @@ class SDPOTrainer:
         self.config = config
         self.tasks_by_id = tasks_by_id
         self.device = device
+        # Full activations at mini-batch x ~3.5k tokens exceed 80 GB; checkpointing trades
+        # them for recompute. use_cache is incompatible with checkpointing (and useless
+        # for full-sequence scoring anyway). Non-reentrant is the variant that composes
+        # with DDP without requiring static_graph.
+        self.unwrapped.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        self.unwrapped.config.use_cache = False
         self.state = TrainerState(
             clipper=EMAAdvantageClipper(
                 mult=config.adv_clip_mult,
@@ -98,6 +107,13 @@ class SDPOTrainer:
         )
         # Set by setup_weight_sync(); None until the weight-transfer group is joined.
         self._transfer_group = None
+
+    @property
+    def unwrapped(self):
+        """The bare HF model. Under DDP `self.model` is a wrapper whose parameter names
+        gain a `module.` prefix -- vLLM's weight receiver and checkpoints need the real
+        names, so anything that reads names or state dicts must go through here."""
+        return getattr(self.model, "module", self.model)
 
     # ---- forward passes ----
 
@@ -161,28 +177,36 @@ class SDPOTrainer:
         accumulated: dict[str, float] = {}
         n_micro = 0
 
-        for start in range(0, len(trajectories), self.config.mini_batch_size):
+        starts = list(range(0, len(trajectories), self.config.mini_batch_size))
+        for start in starts:
             end = min(start + self.config.mini_batch_size, len(trajectories))
             micro = _slice_batch(batch, start, end)
 
-            student_lp = self._student_logprobs(micro, max_response)
-            teacher_lp = self._teacher_logprobs(micro, max_response)
-
-            loss, metrics = sdpo_loss(
-                student_log_probs=student_lp,
-                teacher_log_probs=teacher_lp,
-                rollout_log_probs=micro.rollout_logprobs,
-                response_mask=micro.response_mask,
-                clipper=self.state.clipper,
-                clip_low=self.config.clip_ratio_low,
-                clip_high=self.config.clip_ratio_high,
-                one_sided=self.config.use_one_sided_clip,
-                one_sided_max=self.config.one_sided_clip_max,
+            # Under DDP every backward all-reduces gradients across ranks; during
+            # accumulation only the LAST chunk's backward should sync. no_sync must wrap
+            # the forward too -- DDP records the sync decision at forward time.
+            is_ddp = isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+            sync_context = (
+                self.model.no_sync() if is_ddp and start != starts[-1] else nullcontext()
             )
+            with sync_context:
+                student_lp = self._student_logprobs(micro, max_response)
+                teacher_lp = self._teacher_logprobs(micro, max_response)
 
-            # Scale so the summed gradient equals the full-batch mean.
-            n_chunks = (len(trajectories) + self.config.mini_batch_size - 1) // self.config.mini_batch_size
-            (loss / n_chunks).backward()
+                loss, metrics = sdpo_loss(
+                    student_log_probs=student_lp,
+                    teacher_log_probs=teacher_lp,
+                    rollout_log_probs=micro.rollout_logprobs,
+                    response_mask=micro.response_mask,
+                    clipper=self.state.clipper,
+                    clip_low=self.config.clip_ratio_low,
+                    clip_high=self.config.clip_ratio_high,
+                    one_sided=self.config.use_one_sided_clip,
+                    one_sided_max=self.config.one_sided_clip_max,
+                )
+
+                # Scale so the summed gradient equals the full-batch mean.
+                (loss / len(starts)).backward()
 
             for key, value in metrics.items():
                 accumulated[key] = accumulated.get(key, 0.0) + value
@@ -250,7 +274,7 @@ class SDPOTrainer:
         bucket: list[tuple[str, torch.Tensor]] = []
         bucket_bytes = 0
 
-        for name, param in self.model.named_parameters():
+        for name, param in self.unwrapped.named_parameters():
             bucket.append((name, param))
             bucket_bytes += param.numel() * param.element_size()
             if bucket_bytes >= max_bytes:
@@ -293,13 +317,13 @@ class SDPOTrainer:
 
     def state_dict(self) -> dict:
         return {
-            "model": self.model.state_dict(),
+            "model": self.unwrapped.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "trainer": self.state.state_dict(),
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self.model.load_state_dict(state["model"])
+        self.unwrapped.load_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.state.load_state_dict(state["trainer"])
 

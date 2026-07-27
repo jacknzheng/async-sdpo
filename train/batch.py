@@ -129,6 +129,45 @@ def build_batch(
     )
 
 
+class _TargetLogProbs(torch.autograd.Function):
+    """log p(target) per position, in fp32, without retaining any full-vocab tensor.
+
+    Forward computes `logits[target] - logsumexp(logits)` over fixed-size chunks of
+    positions, so the fp32 workspace is bounded (~CHUNK x vocab floats) no matter how long
+    the batch is. Backward recomputes the softmax chunk-by-chunk from the saved logits --
+    d(log p(y))/d(logits) = onehot(y) - softmax(logits) -- instead of letting autograd
+    save a [N, vocab] log_softmax output, which at Qwen3's 151k vocab is tens of GB.
+
+    `save_for_backward(logits)` stores a reference, not a copy: the logits already live in
+    the graph as the lm_head output, so the only real memory cost here is the [N] result.
+    """
+
+    CHUNK = 512  # positions per chunk: 512 x 151k vocab x 4 bytes ~= 310 MB of workspace
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(targets.shape, dtype=torch.float32, device=logits.device)
+        for s in range(0, logits.size(0), _TargetLogProbs.CHUNK):
+            e = s + _TargetLogProbs.CHUNK
+            chunk = logits[s:e].float()
+            picked = chunk.gather(1, targets[s:e].unsqueeze(1)).squeeze(1)
+            out[s:e] = picked - chunk.logsumexp(dim=1)
+        ctx.save_for_backward(logits, targets)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        logits, targets = ctx.saved_tensors
+        grad = torch.empty_like(logits)
+        for s in range(0, logits.size(0), _TargetLogProbs.CHUNK):
+            e = s + _TargetLogProbs.CHUNK
+            chunk = torch.softmax(logits[s:e].float(), dim=1).neg_()
+            rows = torch.arange(chunk.size(0), device=chunk.device)
+            chunk[rows, targets[s:e]] += 1.0
+            grad[s:e] = (chunk * grad_out[s:e].unsqueeze(1)).to(logits.dtype)
+        return grad, None
+
+
 def gather_response_logprobs(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
@@ -145,10 +184,20 @@ def gather_response_logprobs(
     response token, regardless of where the response sits in the padded sequence. That
     packing is what lets student and teacher log-probs be compared elementwise even though
     their prompts differ in length.
+
+    MEMORY: this must never keep a full-vocab tensor beyond the logits themselves. A
+    log_softmax over [B, T, 151k vocab] in fp32 is ~25-35 GB at mini-batch 16, and autograd
+    retains it for backward (F.cross_entropy is no escape: in eager mode it decomposes into
+    log_softmax + nll_loss and saves the same tensor). `_TargetLogProbs` below does the
+    math in fp32 chunks and saves only the logits, which the graph holds anyway. Invisible
+    in CPU tests (tiny vocab), an instant OOM on an 80 GB H100.
     """
-    log_probs = torch.log_softmax(logits[:, :-1].float(), dim=-1)
     targets = input_ids[:, 1:]
-    token_logprobs = torch.gather(log_probs, 2, targets.unsqueeze(-1)).squeeze(-1)
+    shifted_logits = logits[:, :-1]
+    batch_size, seq_len, vocab = shifted_logits.shape
+    token_logprobs = _TargetLogProbs.apply(
+        shifted_logits.reshape(-1, vocab), targets.reshape(-1)
+    ).view(batch_size, seq_len)
 
     # response_mask marks response positions in the *unshifted* sequence; after the shift,
     # position t of token_logprobs corresponds to input position t+1.

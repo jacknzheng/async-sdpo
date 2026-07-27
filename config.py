@@ -20,14 +20,18 @@ class Config:
     dtype: str = "bfloat16"
 
     # ---- GPU topology (8 total) ----
-    # 4 trainer GPUs rather than 5: FSDP shards weights across ranks, and a power of two
-    # divides attention heads and shard sizes evenly. With 5 you pay padding waste and
-    # awkward collectives for no benefit.
-    n_rollout_gpus: int = 3
+    # 4 rollout + 4 trainer. Rollout GPUs come first (vLLM's workers take cuda:0..N-1),
+    # trainer rank r pins cuda:{n_rollout_gpus + r}. TP=4 is a power of two, so it divides
+    # Qwen3's attention heads evenly.
+    n_rollout_gpus: int = 4
+    # Trainer is DDP: Qwen3-4B (~8 GB bf16 + ~32 GB Adam state) fits on one 80 GB H100,
+    # so each rank holds a full copy and only gradients are synced -- FSDP's sharding
+    # would buy nothing here and add failure modes.
     n_trainer_gpus: int = 4
-    # The hinted teacher is a forward-only copy of the same weights. Giving it a dedicated
-    # GPU keeps it from contending with optimizer state on the trainer shards.
-    n_teacher_gpus: int = 1
+    # The hinted teacher needs no GPU of its own: it is the SAME weights as the student,
+    # and every DDP rank already holds a full copy, so each rank runs its own teacher
+    # forward locally under no_grad.
+    n_teacher_gpus: int = 0
 
     # ---- batching ----
     batch_size: int = 32
@@ -136,9 +140,15 @@ class Config:
     output_dir: str = "runs/sdpo-diligence"
 
     def __post_init__(self) -> None:
+        # <= 8 rather than == 8: dataclasses.replace() re-runs this check, and the smoke
+        # config deliberately uses a subset of the box (1 rollout + 1 trainer).
         total = self.n_rollout_gpus + self.n_trainer_gpus + self.n_teacher_gpus
-        if total != 8:
-            raise ValueError(f"GPU split must sum to 8, got {total}")
+        if total > 8:
+            raise ValueError(f"GPU split must sum to <= 8, got {total}")
+        if self.n_rollout_gpus < 1 or self.n_trainer_gpus < 1:
+            raise ValueError("need at least 1 rollout GPU and 1 trainer GPU")
+        # batch_size % n_trainer_gpus is checked in run.py at launch, against the actual
+        # torchrun world size -- tests use tiny batches with no GPUs at all.
         if not self.clip_ratio_low < 1.0 < self.clip_ratio_high:
             raise ValueError(
                 f"clip window [{self.clip_ratio_low}, {self.clip_ratio_high}] must contain "

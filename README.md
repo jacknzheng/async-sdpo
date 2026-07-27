@@ -67,7 +67,7 @@ disagrees" and is the entire point.
 | Setting            | Value                             | Source                      |
 | ------------------ | --------------------------------- | --------------------------- |
 | model              | `Qwen/Qwen3-4B`                   | spec                        |
-| GPUs               | 3 rollout / 4 trainer / 1 teacher | see below                   |
+| GPUs               | 4 rollout / 4 trainer (DDP)       | see below                   |
 | batch / mini-batch | 32 / 16                           | spec                        |
 | max staleness K    | 3                                 | blog + confirmed            |
 | clip window        | `clip(r, 0.8, 1.4)`               | see below                   |
@@ -75,9 +75,15 @@ disagrees" and is the entire point.
 | group size         | 1, failures retained              | blog's headline finding     |
 | KL penalty         | off                               | blog dropped it             |
 
-**GPU split.** 4 trainer GPUs rather than 5: FSDP shards weights across ranks, and a power
-of two divides attention heads and shard sizes evenly. The 8th GPU hosts the hinted-teacher
-forward pass, which needs a forward-only copy anyway.
+**GPU split.** Rollout GPUs come first (vLLM's multiprocess workers pick `cuda:0..TP-1`
+by worker index); each trainer rank pins `cuda:{n_rollout_gpus + rank}`. The trainer is
+**DDP, not FSDP**: Qwen3-4B (~8 GB bf16 weights + ~32 GB Adam state) fits on a single
+80 GB H100, so sharding buys nothing — each rank holds a full copy and only gradients are
+all-reduced. The hinted teacher gets **no dedicated GPU**: it is the *same weights* as the
+student, and every DDP rank already holds a full copy, so each rank runs its own teacher
+forward locally under `no_grad`. That frees the 8th GPU for rollout (TP=4, a power of two,
+divides attention heads evenly), which is the slow side and the reason this run is async
+in the first place.
 
 **Clip window.** The IS ratio `r = π_current/π_rollout` is centered at **1.0**, so the
 window must contain 1.0 — a `[1.2, 1.4]` window would clip every _unchanged_ token. `1.4`
@@ -140,7 +146,7 @@ Everything through the trainer is CPU-testable — no GPU, no model downloads:
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python torch transformers datasets rubric requests \
   python-dotenv pytest
-.venv/bin/python -m pytest tests/ -q          # 101 tests
+.venv/bin/python -m pytest tests/ -q          # 123 tests
 ```
 
 The test suite is fully offline. Only the judge reaches the network, and only at eval time
@@ -215,14 +221,25 @@ Written against **vLLM 0.26.x — pin it exactly.** The native weight-transfer A
 On the 8-GPU box:
 
 ```bash
-python run.py --baseline   # zero-shot held-out judge score (the number to beat)
-python run.py --smoke      # 10 steps on Qwen3-0.6B — checks weight sync and the loop
-python run.py              # the real run
+python run.py --baseline               # zero-shot held-out judge score (the number to beat)
+python run.py --smoke                  # 10 steps on Qwen3-0.6B, 2 GPUs, single process
+torchrun --nproc-per-node=4 run.py     # the real run: 4 vLLM GPUs + 4 DDP trainer ranks
 ```
+
+The real run must be launched with `torchrun` (one process per trainer GPU); rank 0 owns
+all the async machinery and broadcasts each batch, ranks 1–3 just train their shard.
+Checkpoints (model + optimizer + EMA-clipper state) land in `runs/sdpo-diligence/step_N/`
+every `checkpoint_interval` steps, plus `step_final/` at the end — RunPod pods get
+interrupted, and a run that saves nothing never happened.
 
 During a real run, watch in order: (1) `teacher-student gap` is clearly non-zero,
 (2) clip fractions are a modest minority of tokens, (3) `staleness` sits at or below 3,
 (4) held-out judge score rises above the zero-shot baseline.
+
+**RunPod checklist.** Point `HF_HOME` at the network volume (or you re-download ~8 GB of
+weights on every pod start), put the `.env` with `OPENROUTER_API_KEY` at the repo root,
+pin `vllm==0.26.0` in the image, and give the container a large `/dev/shm` — vLLM's
+multiprocess tensor-parallel workers communicate through it.
 
 ## Deviations from the blog, and why
 

@@ -13,7 +13,7 @@ while training nothing useful:
 import pytest
 import torch
 
-from train.batch import build_batch, gather_response_logprobs
+from train.batch import _TargetLogProbs, build_batch, gather_response_logprobs
 from train.store import Trajectory
 
 
@@ -91,6 +91,46 @@ def test_gather_recovers_known_logprobs_exactly():
         log_probs[0, 3, 5],  # logits at pos 3 predict token at pos 4 (id 5)
     ])
     torch.testing.assert_close(packed[0], expected)
+
+
+def test_target_logprobs_match_log_softmax_value_and_gradient(monkeypatch):
+    """The chunked fp32 path must be a drop-in for full-vocab log_softmax + gather.
+
+    CHUNK is forced below the row count so the multi-chunk code actually runs -- at the
+    default 512 a small test tensor would take the single-chunk path and prove nothing.
+    Gradient equality is the part that matters: forward-only equivalence would not catch a
+    wrong backward, which trains on garbage while looking healthy.
+    """
+    monkeypatch.setattr(_TargetLogProbs, "CHUNK", 3)
+    torch.manual_seed(0)
+    logits = torch.randn(7, 11, requires_grad=True)
+    targets = torch.randint(0, 11, (7,))
+
+    out = _TargetLogProbs.apply(logits, targets)
+
+    ref_logits = logits.detach().clone().requires_grad_(True)
+    ref = (
+        torch.log_softmax(ref_logits, dim=-1).gather(1, targets.unsqueeze(1)).squeeze(1)
+    )
+    torch.testing.assert_close(out, ref)
+
+    grad_out = torch.randn(7)
+    out.backward(grad_out)
+    ref.backward(grad_out)
+    torch.testing.assert_close(logits.grad, ref_logits.grad)
+
+
+def test_target_logprobs_bf16_logits_give_fp32_result():
+    """bf16 model logits must come out as fp32 log-probs (the fp32 math happens inside),
+    and the gradient must land back in the logits' own dtype."""
+    logits = torch.randn(4, 9).bfloat16().requires_grad_(True)
+    targets = torch.randint(0, 9, (4,))
+
+    out = _TargetLogProbs.apply(logits, targets)
+    assert out.dtype == torch.float32
+
+    out.sum().backward()
+    assert logits.grad is not None and logits.grad.dtype == torch.bfloat16
 
 
 def test_gather_is_left_packed_regardless_of_offset():
