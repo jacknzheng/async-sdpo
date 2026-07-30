@@ -14,7 +14,7 @@ same weights as the student, and every DDP rank holds a full copy, so each rank 
 own teacher forward locally under no_grad.
 
 Run:
-    torchrun --nproc-per-node=4 run.py     # full run on Qwen3-4B, all 8 GPUs
+    torchrun --nproc-per-node=4 run.py     # full run on Qwen3-8B, all 8 GPUs
     python run.py --smoke                  # 10 steps on Qwen3-0.6B, 2 GPUs, single process
     python run.py --baseline               # zero-shot judge score, no training
 """
@@ -36,6 +36,23 @@ from dotenv import load_dotenv
 # Must run before reward.judge is touched: the judge reads OPENROUTER_API_KEY from the
 # environment when it constructs its generator.
 load_dotenv()
+
+# Persistent caches, BEFORE the project imports below: huggingface_hub reads HF_HOME at
+# import time, and the vLLM engine processes rank 0 spawns inherit this environment.
+# /workspace is RunPod's volume disk -- it survives pod stop/start, so everything cached
+# here (model weights, vLLM's torch.compile artifacts, the trainer's inductor/Triton
+# kernels) is paid for once per pod, not once per boot. All setdefault: whatever the user
+# exports wins. Single engine -> one shared VLLM_CACHE_ROOT (healthbench-rl's per-engine
+# dirs guard against multi-engine races we don't have).
+if os.path.isdir("/workspace"):
+    os.environ.setdefault("VLLM_CACHE_ROOT", "/workspace/.cache/vllm")
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/workspace/.cache/torchinductor")
+    os.environ.setdefault("TRITON_CACHE_DIR", "/workspace/.cache/triton")
+    os.environ.setdefault("HF_HOME", "/workspace/hf")
+# Qwen3-8B pure-bf16 AdamW sits at ~65 of 80 GB per trainer rank (16 weights + 16 grads
+# + 33 optimizer state); expandable segments lets the allocator grow in place instead of
+# fragmenting. Drop this line if vLLM ever objects -- it is an aid, not a requirement.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from config import CONFIG, Config  # noqa: E402
 from data.dataset import load_tasks, split_tasks  # noqa: E402
@@ -74,10 +91,17 @@ def build_trainer(config: Config, smoke: bool, store: TrajectoryStore, tasks) ->
         model_name, torch_dtype=getattr(torch, config.dtype)
     ).to(device)
     if world > 1:
-        # DDP: every rank holds full weights (Qwen3-4B fits on one H100), only gradients
-        # are all-reduced. The constructor broadcasts rank 0's weights, so all ranks start
-        # identical and stay identical.
+        # DDP: every rank holds full weights (Qwen3-8B fits on one H100, tightly), only
+        # gradients are all-reduced. The constructor broadcasts rank 0's weights, so all
+        # ranks start identical and stay identical.
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device.index])
+    if config.compile_trainer:
+        # Compile OUTSIDE the DDP wrap: DDP(torch.compile(hf)) would bury `_orig_mod.` in
+        # every parameter name reaching vLLM's weight receiver and the checkpoints.
+        # dynamic=True because padded batch shapes differ every step -- a static compile
+        # would recompile per shape. Kernels cache to TORCHINDUCTOR_CACHE_DIR (above), so
+        # only the first-ever step pays the compile.
+        model = torch.compile(model, dynamic=True)
 
     return SDPOTrainer(
         model=model,
@@ -284,9 +308,10 @@ def main() -> None:
     if args.hint_prompt:
         config = replace(config, error_hint_prompt=args.hint_prompt)
     if args.smoke:
+        # compile_trainer off: smoke exists to validate the plumbing in minutes, and
+        # compiling the throwaway 0.6B model fights exactly that.
         config = replace(config, total_steps=10, batch_size=4, mini_batch_size=2,
-                         eval_interval=5, n_rollout_gpus=1, n_trainer_gpus=1,
-                         n_teacher_gpus=0)
+                         eval_interval=5, n_rollout_gpus=1, n_trainer_gpus=1, compile_trainer=False)
 
     rank, world = _dist_info()
     if world > 1:

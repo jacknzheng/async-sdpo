@@ -249,6 +249,52 @@ def test_small_bucket_size_produces_multiple_buckets():
     assert len(list(trainer.weight_buckets())) > 1
 
 
+def test_weight_bucket_names_survive_torch_compile():
+    """torch.compile wraps the model in an OptimizedModule whose parameters are named
+    `_orig_mod.*`; `unwrapped` must peel that or vLLM's receiver rejects every weight.
+    Wrapper creation is lazy (no trace until a forward), so this is cheap on CPU."""
+    trainer = SDPOTrainer(
+        model=torch.compile(_model()),
+        tokenizer=FakeTokenizer(),
+        store=TrajectoryStore(max_staleness=3),
+        config=Config(batch_size=4, mini_batch_size=2),
+        tasks_by_id={"1": _task("1")},
+        device="cpu",
+    )
+    shipped = [n for names, *_ in trainer.weight_buckets() for n in names]
+    assert shipped and all(not n.startswith("_orig_mod.") for n in shipped)
+    assert trainer._ddp is None  # compiled but not DDP -> no no_sync handle
+
+
+def test_unwrapped_peels_compile_and_ddp_wrappers():
+    """The full production wrapping is torch.compile(DDP(hf)). Parameter names must come
+    out bare, and the resolved DDP handle (used for no_sync during accumulation) must be
+    found through the compile wrapper -- an isinstance check on the outer model misses it,
+    which skips no_sync and hangs ranks with unequal chunk counts."""
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method="tcp://127.0.0.1:29517", world_size=1, rank=0
+    )
+    try:
+        ddp = torch.nn.parallel.DistributedDataParallel(_model())
+        trainer = SDPOTrainer(
+            model=torch.compile(ddp),
+            tokenizer=FakeTokenizer(),
+            store=TrajectoryStore(max_staleness=3),
+            config=Config(batch_size=4, mini_batch_size=2),
+            tasks_by_id={"1": _task("1")},
+            device="cpu",
+        )
+        assert trainer._ddp is ddp
+        shipped = [n for names, *_ in trainer.weight_buckets() for n in names]
+        assert shipped and all(
+            not n.startswith(("_orig_mod.", "module.")) for n in shipped
+        )
+    finally:
+        dist.destroy_process_group()
+
+
 def test_send_weight_bucket_requires_setup():
     trainer = _trainer()
     with pytest.raises(RuntimeError, match="weight sync not initialized"):

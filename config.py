@@ -14,7 +14,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Config:
     # ---- model ----
-    model: str = "Qwen/Qwen3-4B"
+    model: str = "Qwen/Qwen3-8B"
     # Tiny model for the end-to-end smoke test before committing GPUs to a real run.
     smoke_model: str = "Qwen/Qwen3-0.6B"
     dtype: str = "bfloat16"
@@ -28,10 +28,6 @@ class Config:
     # so each rank holds a full copy and only gradients are synced -- FSDP's sharding
     # would buy nothing here and add failure modes.
     n_trainer_gpus: int = 4
-    # The hinted teacher needs no GPU of its own: it is the SAME weights as the student,
-    # and every DDP rank already holds a full copy, so each rank runs its own teacher
-    # forward locally under no_grad.
-    n_teacher_gpus: int = 0
 
     # ---- batching ----
     batch_size: int = 32
@@ -70,6 +66,12 @@ class Config:
     # BLOG: dropped in favor of advantage clipping -- a reference-model KL penalty roughly
     # doubles forward-pass compute and biases the policy toward whatever reference is chosen.
     use_kl_penalty: bool = False
+
+    # torch.compile the trainer model (dynamic shapes; inductor cache persisted to
+    # /workspace by run.py, so the compile cost is paid once per pod, not per boot).
+    # THE escape hatch: compile + DDP + gradient checkpointing + varying batch shapes is
+    # the most fragile stack in this design -- flip to False first when debugging.
+    compile_trainer: bool = True
 
     # ---- optimizer ----
     learning_rate: float = 1e-6
@@ -142,7 +144,7 @@ class Config:
     def __post_init__(self) -> None:
         # <= 8 rather than == 8: dataclasses.replace() re-runs this check, and the smoke
         # config deliberately uses a subset of the box (1 rollout + 1 trainer).
-        total = self.n_rollout_gpus + self.n_trainer_gpus + self.n_teacher_gpus
+        total = self.n_rollout_gpus + self.n_trainer_gpus
         if total > 8:
             raise ValueError(f"GPU split must sum to <= 8, got {total}")
         if self.n_rollout_gpus < 1 or self.n_trainer_gpus < 1:

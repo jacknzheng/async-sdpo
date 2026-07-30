@@ -66,7 +66,7 @@ disagrees" and is the entire point.
 
 | Setting            | Value                             | Source                      |
 | ------------------ | --------------------------------- | --------------------------- |
-| model              | `Qwen/Qwen3-4B`                   | spec                        |
+| model              | `Qwen/Qwen3-8B`                   | spec                        |
 | GPUs               | 4 rollout / 4 trainer (DDP)       | see below                   |
 | batch / mini-batch | 32 / 16                           | spec                        |
 | max staleness K    | 3                                 | blog + confirmed            |
@@ -77,9 +77,10 @@ disagrees" and is the entire point.
 
 **GPU split.** Rollout GPUs come first (vLLM's multiprocess workers pick `cuda:0..TP-1`
 by worker index); each trainer rank pins `cuda:{n_rollout_gpus + rank}`. The trainer is
-**DDP, not FSDP**: Qwen3-4B (~8 GB bf16 weights + ~32 GB Adam state) fits on a single
-80 GB H100, so sharding buys nothing — each rank holds a full copy and only gradients are
-all-reduced. The hinted teacher gets **no dedicated GPU**: it is the *same weights* as the
+**DDP, not FSDP**: Qwen3-8B in pure bf16 (~16 GB weights + ~16 GB gradients + ~33 GB Adam
+state ≈ 65 GB) fits on a single 80 GB H100 — tightly, which is why `run.py` sets
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` — so sharding buys nothing; each rank
+holds a full copy and only gradients are all-reduced. The hinted teacher gets **no dedicated GPU**: it is the *same weights* as the
 student, and every DDP rank already holds a full copy, so each rank runs its own teacher
 forward locally under `no_grad`. That frees the 8th GPU for rollout (TP=4, a power of two,
 divides attention heads evenly), which is the slow side and the reason this run is async
@@ -236,10 +237,31 @@ During a real run, watch in order: (1) `teacher-student gap` is clearly non-zero
 (2) clip fractions are a modest minority of tokens, (3) `staleness` sits at or below 3,
 (4) held-out judge score rises above the zero-shot baseline.
 
-**RunPod checklist.** Point `HF_HOME` at the network volume (or you re-download ~8 GB of
-weights on every pod start), put the `.env` with `OPENROUTER_API_KEY` at the repo root,
-pin `vllm==0.26.0` in the image, and give the container a large `/dev/shm` — vLLM's
-multiprocess tensor-parallel workers communicate through it.
+**Cold start & compile caches.** When `/workspace` (RunPod's volume disk, which survives
+pod stop/start) exists, `run.py` automatically points every slow-to-rebuild cache at it:
+
+| env var                  | default                          | what it saves on re-boot        |
+| ------------------------ | -------------------------------- | ------------------------------- |
+| `VLLM_CACHE_ROOT`        | `/workspace/.cache/vllm`         | vLLM's torch.compile artifacts  |
+| `TORCHINDUCTOR_CACHE_DIR`| `/workspace/.cache/torchinductor`| trainer's compiled kernels      |
+| `TRITON_CACHE_DIR`       | `/workspace/.cache/triton`       | trainer's Triton kernels        |
+| `HF_HOME`                | `/workspace/hf`                  | ~16 GB model download           |
+
+All are `setdefault`, so anything you export yourself wins. The FIRST run on a fresh pod
+pays everything once — model download, vLLM engine compile, and the trainer's
+`torch.compile` on its first step (the trainer compiles with `dynamic=True` because padded
+batch shapes differ every step). Every boot after that reuses the caches and starts in
+seconds, not tens of minutes. If training misbehaves, `compile_trainer=False` in
+`config.py` is the first debug lever — compile + DDP + gradient checkpointing + varying
+shapes is the most fragile stack in here (`--smoke` already runs uncompiled for this
+reason).
+
+**RunPod checklist.** Put the `.env` with `OPENROUTER_API_KEY` at the repo root, pin
+`vllm==0.26.0` in the image, and give the container a large `/dev/shm` — vLLM's
+multiprocess tensor-parallel workers communicate through it. Also put the *venv itself*
+on `/workspace` (e.g. `uv venv /workspace/venv && uv pip install --python
+/workspace/venv/bin/python -r requirements.txt`): packages download and build once on the
+first boot and every later boot is a seconds-fast no-op.
 
 ## Deviations from the blog, and why
 

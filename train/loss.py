@@ -109,15 +109,12 @@ def clip_ratio(
 class EMAAdvantageClipper:
     """Bounds per-token advantage at a fixed multiple of its running mean magnitude.
 
-    The blog specifies only "a fixed multiple of its running mean" at 3x -- it never says
-    which statistic, over what window, or how it is initialized. This is our spec:
-
         batch_mean = masked_mean(|A_t|)                     # this step, response tokens
         ema        = decay * ema + (1 - decay) * batch_mean
         ema_hat    = ema / (1 - decay ** step)              # bias correction
         A_clipped  = clamp(A_t, -mult * ema_hat, +mult * ema_hat)
 
-    Two deliberate choices:
+    Two design choices:
 
     * We track the mean of |A_t|, not of A_t. Signed advantages are roughly symmetric
       around zero, so a signed mean would cancel toward 0 and the clip bound would
@@ -127,7 +124,7 @@ class EMAAdvantageClipper:
       when training is least stable.
 
     `step` is state, so this object MUST be checkpointed with the model to resume
-    correctly, and `ema` must be all-reduced across trainer ranks (see `sync_`) or ranks
+    correctly, and `ema` must be all-reduced across trainer ranks or ranks
     will silently clip differently and diverge.
     """
 

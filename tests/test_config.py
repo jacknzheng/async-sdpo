@@ -15,13 +15,13 @@ from config import CONFIG, Config
 def test_smoke_replace_does_not_raise():
     smoke = replace(
         CONFIG, total_steps=10, batch_size=4, mini_batch_size=2, eval_interval=5,
-        n_rollout_gpus=1, n_trainer_gpus=1, n_teacher_gpus=0,
+        n_rollout_gpus=1, n_trainer_gpus=1
     )
     assert smoke.n_rollout_gpus == 1 and smoke.n_trainer_gpus == 1
 
 
 def test_default_split_uses_the_whole_box():
-    assert CONFIG.n_rollout_gpus + CONFIG.n_trainer_gpus + CONFIG.n_teacher_gpus == 8
+    assert CONFIG.n_rollout_gpus + CONFIG.n_trainer_gpus == 8
 
 
 def test_gpu_split_over_eight_rejected():

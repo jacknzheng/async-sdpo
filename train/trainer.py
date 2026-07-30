@@ -107,13 +107,25 @@ class SDPOTrainer:
         )
         # Set by setup_weight_sync(); None until the weight-transfer group is joined.
         self._transfer_group = None
+        # The DDP module, resolved through the torch.compile wrapper: a compiled DDP model
+        # is an OptimizedModule, so an isinstance check on self.model would miss it, skip
+        # no_sync during accumulation, and ranks with unequal chunk counts would hang in
+        # mismatched gradient all-reduces.
+        inner = getattr(model, "_orig_mod", model)
+        self._ddp = (
+            inner
+            if isinstance(inner, torch.nn.parallel.DistributedDataParallel)
+            else None
+        )
 
     @property
     def unwrapped(self):
-        """The bare HF model. Under DDP `self.model` is a wrapper whose parameter names
-        gain a `module.` prefix -- vLLM's weight receiver and checkpoints need the real
-        names, so anything that reads names or state dicts must go through here."""
-        return getattr(self.model, "module", self.model)
+        """The bare HF model beneath the wrappers. torch.compile prefixes parameter names
+        with `_orig_mod.` and DDP with `module.` -- vLLM's weight receiver and checkpoints
+        need the real HF names, so anything that reads names or state dicts must go
+        through here. Peel order matches wrap order: compile is applied outside DDP."""
+        model = getattr(self.model, "_orig_mod", self.model)  # torch.compile wrapper
+        return getattr(model, "module", model)                # DDP wrapper
 
     # ---- forward passes ----
 
@@ -185,9 +197,10 @@ class SDPOTrainer:
             # Under DDP every backward all-reduces gradients across ranks; during
             # accumulation only the LAST chunk's backward should sync. no_sync must wrap
             # the forward too -- DDP records the sync decision at forward time.
-            is_ddp = isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
             sync_context = (
-                self.model.no_sync() if is_ddp and start != starts[-1] else nullcontext()
+                self._ddp.no_sync()
+                if self._ddp is not None and start != starts[-1]
+                else nullcontext()
             )
             with sync_context:
                 student_lp = self._student_logprobs(micro, max_response)
