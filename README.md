@@ -174,6 +174,30 @@ What the tests actually pin down:
   the trainer broadcasts. Also mutation-verified: restoring the naive
   await-then-broadcast order makes the test hang and fail.
 
+## Backends
+
+The inference engine sits behind two protocols in `train/engine.py`, so a new backend is a
+new file plus a config value rather than an edit to the trainer:
+
+| protocol | side | who holds it | vLLM implementation |
+| --- | --- | --- | --- |
+| `InferenceEngine` | receive | orchestrator (`run.py`) | `VLLMRolloutEngine` |
+| `WeightTransport` | send | trainer (`train/trainer.py`) | `NCCLWeightTransport` |
+
+They are **always chosen together** — `train/backends/get_backend(name)` returns the pair,
+selected by `config.rollout_backend` (default `"vllm"`). The receiver derives its
+broadcasts from metadata the sender chose, so a mismatched pair would hang the rendezvous
+rather than fail loudly; pairing them at the selector makes that unrepresentable.
+
+Two protocols rather than one because fusing them would put engine concerns back inside
+the trainer — which is the coupling this exists to remove. `train/backends/vllm.py` is the
+only module in the package that imports vLLM, and every import there is lazy, so the
+package stays importable (and the full test suite runs) on a laptop without vLLM.
+
+Adding a backend means implementing both protocols. **Read the invariants at the top of
+`train/engine.py` first** — particularly processed-logprobs, which a new engine can violate
+silently: SGLang's logprob semantics differ from vLLM's and must be verified, not assumed.
+
 ## Weight sync
 
 Uses vLLM's **native** `vllm.distributed.weight_transfer` NCCL API, matching the approach

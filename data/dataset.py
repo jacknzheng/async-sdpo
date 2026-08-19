@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 from rubric import Criterion, Rubric
 
-
+### BUILD TASKS AND PROMPTS
 @dataclass
 class Task:
     """One diligence-bench row, with everything the rollout and judge need."""
@@ -29,23 +29,14 @@ class Task:
     sections: list[dict]
     # Parsed criteria in flattened order -- the order the judge reports verdicts in.
     criteria: list[Criterion] = field(default_factory=list)
-    # section id -> (start, end) index range into `criteria`. The rubric package's
-    # `Criterion` model keeps only `weight` and `requirement`, so section membership and
-    # criterion ids are lost on parse; we record the spans here to still report per-section
-    # scores. factual-accuracy carries 73% of the weight, so watching it move on its own
-    # is worth the bookkeeping.
     section_spans: dict[str, tuple[int, int]] = field(default_factory=dict)
-    # NOTE: no `hint` field. Hints are generated per-rollout from the draft the model
-    # actually produced (data/hint.py), so they belong to the Trajectory, not the Task --
-    # a task-level hint would be identical across every rollout, which is exactly the
-    # static behavior this replaced.
 
     def to_rubric(self) -> Rubric:
         return Rubric(self.criteria)
 
 
 def _build_task(row: dict) -> Task:
-    sections = row["rubric"]["sections"]
+    sections = row["rubric"]["sections"] # index into the sections to get the list of arrays with the criteria
 
     # Rubric.validate_and_create_criteria natively accepts the {"sections": [...]} shape,
     # flattening nested criteria in order -- no reshaping needed.
@@ -77,7 +68,7 @@ def load_tasks(
     dataset_name: str = "paperinstruments/diligence-bench",
     split: str = "test",
 ) -> list[Task]:
-    """Load all 150 rows as Task objects. Hints are generated per-rollout, not here."""
+    """Load all 150 rows as Task objects"""
     from datasets import load_dataset  # imported lazily; heavy and network-bound
 
     rows = load_dataset(dataset_name, split=split)
@@ -115,3 +106,6 @@ def build_prompt(task: Task, hint: str | None = None) -> str:
             f"{task.query}"
         )
     return f"Answer the following financial diligence question.\n\n{task.query}"
+
+### PROMPTS
+

@@ -1,67 +1,12 @@
-"""SDPO loss, DAPO ratio clipping, and EMA advantage clipping.
-
-Pure tensor math -- no I/O, no CUDA required, no model objects. Everything here runs on
-CPU so it can be unit-tested without a GPU, which matters because this file is where the
-correctness of the whole run lives.
-
-=============================================================================
-THE SIGN CONVENTION -- read before touching anything below
-=============================================================================
-SDPO's loss is the per-token REVERSE KL between the student and a stop-gradient teacher,
-where the teacher is the SAME WEIGHTS conditioned on a hint:
-
-    L = E_tau [ sum_t KL( pi(.|s_t) || stopgrad(pi(.|s_t, c)) ) ]
-
-The single-sample estimator, matching the official implementation
-(lasgroup/SDPO verl/trainer/ppo/core_algos.py and TRL trl/experimental/sdpo/loss_utils.py,
-which are byte-for-byte equivalent):
-
-    log_ratio      = student_log_probs - teacher_log_probs
-    per_token_loss = log_ratio.detach() * student_log_probs
-
-As a LOSS TO MINIMIZE the coefficient is (log pi_student - log pi_teacher).
-As an ADVANTAGE for a maximizing update it is the NEGATION:
-
-    A_t = log pi_teacher(a_t) - log pi_student(a_t)
-
-positive for tokens the teacher likes more than the student. We use the advantage form
-internally because advantage clipping is defined on it, then negate once at the end.
-
-Flipping this sign trains the model to reinforce precisely the tokens the teacher
-disagrees with. It will not crash and it will produce a plausible-looking loss curve.
-`test_loss.py::test_gradient_moves_toward_teacher` is the guard.
-
-There is deliberately NO baseline, NO +1 term, NO Schulman k3 estimator, and NO advantage
-whitening. The paper proves the baseline term vanishes identically (Appendix B.1), and
-whitening would destroy the signal: unlike GRPO's relative advantages, the ABSOLUTE sign
-here means "teacher agrees / disagrees" and is the entire point.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
 
-
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean of `x` over positions where `mask` is 1, guarding against an empty mask."""
     return (x * mask).sum() / mask.sum().clamp(min=1.0)
-
-
-def sdpo_advantage(
-    student_log_probs: torch.Tensor,
-    teacher_log_probs: torch.Tensor,
-) -> torch.Tensor:
-    """Per-token SDPO advantage: how much more the teacher likes this token.
-
-        A_t = log pi_teacher(a_t | s_t, c) - log pi_student(a_t | s_t)
-
-    Positive => the hinted teacher assigns higher probability than the student, so the
-    student should move toward this token. Detached: no gradient flows through the
-    advantage, only through the student log-prob it multiplies.
-    """
-    return (teacher_log_probs - student_log_probs).detach()
 
 
 def importance_ratio(
@@ -107,25 +52,12 @@ def clip_ratio(
 
 @dataclass
 class EMAAdvantageClipper:
-    """Bounds per-token advantage at a fixed multiple of its running mean magnitude.
+    """Bounds per-token advantage at a fixed multiple of its running mean magnitude, prevents advantage explosion from rogue tokens.
 
-        batch_mean = masked_mean(|A_t|)                     # this step, response tokens
+        batch_mean = masked_mean(|A_t|)                         # this step, response tokens
         ema        = decay * ema + (1 - decay) * batch_mean
-        ema_hat    = ema / (1 - decay ** step)              # bias correction
+        ema_hat    = ema / (1 - decay ** step)                  # bias correction
         A_clipped  = clamp(A_t, -mult * ema_hat, +mult * ema_hat)
-
-    Two design choices:
-
-    * We track the mean of |A_t|, not of A_t. Signed advantages are roughly symmetric
-      around zero, so a signed mean would cancel toward 0 and the clip bound would
-      collapse onto nothing.
-    * Bias correction is on. An EMA initialized at 0 is badly biased low for the first
-      ~1/(1-decay) steps (~100 here), which would make the bound far too tight exactly
-      when training is least stable.
-
-    `step` is state, so this object MUST be checkpointed with the model to resume
-    correctly, and `ema` must be all-reduced across trainer ranks or ranks
-    will silently clip differently and diverge.
     """
 
     mult: float = 3.0
@@ -135,18 +67,20 @@ class EMAAdvantageClipper:
     step: int = 0
 
     def bound(self) -> float:
-        """Current clip bound, or inf before the first update (no data yet -> no clipping)."""
+        """Current clip bound, or inf before the first update (no data yet -> no clipping)"""
         if self.step == 0:
             return float("inf")
         ema_hat = self.ema
         if self.bias_correction:
-            ema_hat = self.ema / (1.0 - self.decay**self.step)
+            ema_hat = self.ema / (1.0 - self.decay**self.step) # in early steps, 0.99 ** 0 is large, which counteracts self.ema being very small (since its biased and initialized at 0)
+            # INTUITION: self.ema = 0.01 / (1-(0.99)^1) = 1, this makes our self.ema less biased towards zero
+            # eventually ema_hat approaches ema, as the denom -> 1
         return self.mult * ema_hat
 
     def update(self, advantages: torch.Tensor, mask: torch.Tensor) -> float:
         """Fold this batch's mean |A| into the EMA and return the new clip bound."""
         batch_mean = masked_mean(advantages.abs(), mask).item()
-        self.ema = self.decay * self.ema + (1.0 - self.decay) * batch_mean
+        self.ema = self.decay * self.ema + (1.0 - self.decay) * batch_mean # 0.99 * old_advantages + 0.01 * new_advantages = EMA advantage
         self.step += 1
         return self.bound()
 
@@ -154,7 +88,7 @@ class EMAAdvantageClipper:
         b = self.bound()
         if b == float("inf"):
             return advantages
-        return advantages.clamp(min=-b, max=b)
+        return advantages.clamp(min=-b, max=b) # clip advantages according to our current EMA
 
     def sync_(self, ema: float) -> None:
         """Overwrite the EMA with an all-reduced value so every rank clips identically."""
@@ -200,7 +134,7 @@ def sdpo_loss(
         zero the hint is too weak for the teacher to beat the student, so the gradient
         vanishes and training will not move regardless of what the loss curve looks like.
     """
-    advantages = sdpo_advantage(student_log_probs, teacher_log_probs)
+    advantages = (teacher_log_probs - student_log_probs).detach()
 
     metrics: dict[str, float] = {
         "teacher_minus_student_logp": masked_mean(advantages, response_mask).item(),
@@ -208,16 +142,16 @@ def sdpo_loss(
     }
 
     if clipper is not None:
-        bound = clipper.update(advantages, response_mask)
-        clipped_adv = clipper.clip(advantages)
-        was_clipped = (advantages.abs() > bound).float()
+        bound = clipper.update(advantages, response_mask) # update based on new advantages
+        clipped_adv = clipper.clip(advantages) # then clip the advantages
+        was_clipped = (advantages.abs() > bound).float() # all tokens where advantage was clipped
         metrics["adv_clip_bound"] = bound
         metrics["adv_clip_frac"] = masked_mean(was_clipped, response_mask).item()
         metrics["adv_ema"] = clipper.ema
         advantages = clipped_adv
 
-    # Advantage form (maximize) -> loss form (minimize) is a single negation. This is the
-    # step that must stay aligned with the sign convention documented at the top.
+    # produces a surrogate loss objective - the gradient of which we use monte carlo sampling to approximate the dense KL
+    # this basically means we don't need to materialize the full [B, T, vocab_size] tensor which would be enormous! 
     per_token_loss = -advantages * student_log_probs
 
     if rollout_log_probs is not None:
@@ -230,7 +164,9 @@ def sdpo_loss(
         metrics["ratio_clip_frac_high"] = masked_mean(high_frac, response_mask).item()
         per_token_loss = per_token_loss * clipped_ratio
 
-    loss = masked_mean(per_token_loss, response_mask)
+    # surrogate gradient = 1/n ∑ d(log student) (log student - log teacher) - summing over just all tokens in the seq
+    # dense gradient = ∑ ∑ d(log student) (log student - log teacher) - summing over all tokens + log_probs of all possible tokens in the seq
+    loss = masked_mean(per_token_loss, response_mask) # masked mean averages the per_token_loss over the actual unmasked tokens (i.e. ignoring prompt tokens)
     metrics["loss"] = loss.item()
     metrics["n_response_tokens"] = response_mask.sum().item()
     return loss, metrics

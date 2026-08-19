@@ -1,28 +1,28 @@
-"""vLLM rollout engine: generation plus native NCCL weight sync.
+"""vLLM backend: the rollout engine (receive side) and the NCCL transport (send side).
 
-Rollout workers run the current policy on training tasks and stream finished trajectories
-into the store. The trainer pulls from the store on its own schedule, which is what makes
-the run off-policy and is the whole point of the exercise.
+Both halves of the vLLM integration live here, and this is the ONLY module in the package
+that imports vLLM. `train/trainer.py` used to import
+`vllm.distributed.weight_transfer.nccl_engine` directly, which meant the trainer could not
+run against any other engine; `NCCLWeightTransport` below is where that code moved.
 
-WEIGHT SYNC uses vLLM's native `vllm.distributed.weight_transfer` API -- the same approach
-as the healthbench-rl project. The engine is constructed with
-`WeightTransferConfig(backend="nccl")`, and the update is a four-call transaction:
+WEIGHT SYNC uses vLLM's native `vllm.distributed.weight_transfer` API. The engine is
+constructed with `WeightTransferConfig(backend="nccl")`, and the update is a four-call
+transaction:
 
     pause_generation(mode="keep") -> start_weight_update()
       -> update_weights(...)  [once per bucket]
       -> finish_weight_update() -> resume_generation()
 
-This is much better than hand-rolling `collective_rpc` against a StatelessProcessGroup:
 vLLM owns the group lifecycle, the receive side posts its own matching broadcasts from the
 names/dtypes/shapes metadata carried in the request, and bucketing is supported natively
 via `packed=True`. There is no worker extension and no private `load_weights` call, so
 none of this rides on unversioned internals.
 
 Ordering still matters: the receivers must have their `update_weights` RPC in flight before
-the trainer enters `trainer_send_weights`, or the sender blocks on a broadcast nobody is
-listening for. The orchestrator owns that interleaving -- see `run.py`.
+the trainer sends, or the sender blocks on a broadcast nobody is listening for. The
+orchestrator owns that interleaving -- see `run.py:sync_weights`.
 
-Two generation details are correctness-critical:
+Two generation details are correctness-critical (invariants 1 and 2 in `train/engine.py`):
 
 1. `logprobs_mode="processed_logprobs"`. The IS ratio's denominator must be the log-prob
    under the distribution the sampler ACTUALLY drew from -- after temperature and any
@@ -38,8 +38,10 @@ VERSION PIN: written against vLLM 0.26.x, which is where the native weight-trans
 `finish_weight_update`) lives. It does NOT exist in 0.11/0.12 -- those releases need the
 older `collective_rpc` + `worker_extension_cls` path. Pin exactly.
 
-This module is the only one that needs real GPUs, so it is deliberately thin -- the loss,
-the store, the batching, and the trainer are all testable without it.
+Every vLLM import is LAZY (inside the method that needs it), so this module -- and the
+package as a whole -- stays importable on a machine without vLLM, e.g. a dev laptop
+running the test suite. `tests/test_rollout.py::test_module_imports_without_vllm_installed`
+pins that.
 """
 
 from __future__ import annotations
@@ -50,9 +52,10 @@ import os
 import uuid
 from dataclasses import asdict, dataclass
 
-from config import Config
+from train.config import Config
 from data.dataset import Task, build_prompt
 from data.hint import build_error_hint
+from train.backends.backend import WeightBucket
 from train.store import Trajectory, TrajectoryStore
 
 logger = logging.getLogger(__name__)
@@ -72,21 +75,22 @@ class RolloutResult:
     text: str
 
 
-class RolloutEngine:
-    """Async wrapper over vLLM's AsyncLLM for off-policy trajectory generation."""
+class VLLMRolloutEngine:
+    """Async wrapper over vLLM's AsyncLLM for off-policy trajectory generation.
+
+    Implements the `InferenceEngine` protocol in `train/engine.py`.
+    """
 
     def __init__(self, config: Config, model: str | None = None, seed: int = 0) -> None:
         self.config = config
-        self.model = model or config.model
+        self.model = model or config.model.model
         self.seed = seed
         self.engine = None
         self.policy_version = 0
         self._weight_group_ready = False
         self._request_counter = 0
-        self._hint_semaphore = asyncio.Semaphore(config.error_hint_concurrency)
-        # Rollouts discarded because no hint could be generated. Watch this: it is wasted
-        # generation compute, and a sustained nonzero value means the hint model is the
-        # bottleneck on data production, not the rollout engine.
+        self._hint_semaphore = asyncio.Semaphore(config.generator.hint.concurrency)
+        # Rollouts discarded because no hint could be generated
         self.hintless_dropped = 0
 
     def start(self) -> None:
@@ -98,44 +102,52 @@ class RolloutEngine:
 
         engine_args = AsyncEngineArgs(
             model=self.model,
-            dtype=self.config.dtype,
-            tensor_parallel_size=self.config.n_rollout_gpus,
+            dtype=self.config.model.dtype,
+            tensor_parallel_size=self.config.generator.engine.n_rollout_gpus,
             distributed_executor_backend=(
-                "mp" if self.config.n_rollout_gpus > 1 else "uni"
+                "mp" if self.config.generator.engine.n_rollout_gpus > 1 else "uni"
             ),
-            # Opts the engine into the native NCCL weight-transfer path.
             weight_transfer_config=WeightTransferConfig(backend="nccl"),
-            gpu_memory_utilization=self.config.gpu_memory_utilization,
+            gpu_memory_utilization=self.config.generator.engine.gpu_memory_utilization,
             enforce_eager=False,
             enable_prefix_caching=True,
-            max_model_len=self.config.max_prompt_tokens + self.config.max_response_tokens,
+            max_model_len=(
+                self.config.generator.engine.max_prompt_tokens
+                + self.config.generator.sampling_params.max_tokens
+            ),
             seed=self.seed,
-            # See module docstring -- the IS ratio denominator must come from the same
-            # processed distribution the sampler drew from.
+            # includes sampling adjustments: top_k, temperature, etc.
             logprobs_mode="processed_logprobs",
         )
         # Synchronous: from_engine_args is not a coroutine, and the engine core process
         # starts in __init__. There is no start()/await to call.
         self.engine = AsyncLLM.from_engine_args(engine_args)
         logger.info(
-            "rollout engine ready: %s on %d GPU(s)", self.model, self.config.n_rollout_gpus
+            "rollout engine ready: %s on %d GPU(s)",
+            self.model,
+            self.config.generator.engine.n_rollout_gpus,
         )
 
     def _sampling_params(self):
+        """Translate our backend-agnostic SamplingParams into vLLM's.
+
+        This is the conversion boundary: train/config.py's SamplingParams imports no vLLM,
+        so config stays cheap to import and a second backend translates the same fields
+        its own way.
+        """
         from vllm import SamplingParams
 
+        sp = self.config.generator.sampling_params
         return SamplingParams(
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            max_tokens=self.config.max_response_tokens,
+            temperature=sp.temperature,
+            top_p=sp.top_p,
+            max_tokens=sp.max_tokens,
             logprobs=0,  # sampled token's own logprob only -- see module docstring
         )
 
     # ---- generation ----
 
     async def generate(self, task: Task, prompt_token_ids: list[int] | None = None) -> RolloutResult:
-        """Generate one completion. The prompt carries NO hint -- the student answers the
-        bare query; only the teacher's context gets the hint."""
         if self.engine is None:
             raise RuntimeError("engine not started; call start() first")
 
@@ -151,26 +163,29 @@ class RolloutEngine:
         request_id = f"{task.task_id}-{self._request_counter}-{uuid.uuid4().hex[:6]}"
 
         # vLLM streams cumulative snapshots; the last one holds the full completion.
-        last_output = None
+        final_output = None
         async for output in self.engine.generate(
             prompt=request_input, sampling_params=self._sampling_params(), request_id=request_id
         ):
-            last_output = output
+            final_output = output
 
-        if last_output is None:
+        if final_output is None:
             raise RuntimeError(f"no output for request {request_id}")
         # An aborted request can come back finished but with no completions.
-        if not last_output.outputs:
+        if not final_output.outputs:
             raise RuntimeError(f"request {request_id} finished with no output (aborted?)")
 
-        completion = last_output.outputs[0]
+        completion = final_output.outputs[0]
         return RolloutResult(
             task_id=task.task_id,
-            prompt_token_ids=list(last_output.prompt_token_ids),
+            prompt_token_ids=list(final_output.prompt_token_ids),
             response_token_ids=list(completion.token_ids),
             logprobs=_extract_sampled_logprobs(completion),
             text=completion.text,
         )
+
+    async def generate_tir(self, task:Task):
+        pass
 
     async def _error_hint(self, task: Task, response_text: str) -> str:
         """Generate the teacher's hint for one rollout. Returns "" if it could not be made.
@@ -184,88 +199,20 @@ class RolloutEngine:
                     query=task.query,
                     sections=task.sections,
                     response_text=response_text,
-                    prompt_variant=self.config.error_hint_prompt,
-                    model=self.config.error_hint_model,
-                    timeout=self.config.error_hint_timeout,
+                    prompt_variant=self.config.generator.hint.prompt,
+                    model=self.config.generator.hint.model,
+                    timeout=self.config.generator.hint.timeout,
                 )
         except Exception:  # noqa: BLE001 -- one failed hint must not kill the worker
             logger.exception("error-hint failed for task %s", task.task_id)
             return ""
-
-    async def run_forever(
-        self,
-        store: TrajectoryStore,
-        tasks: list[Task],
-        stop_event: asyncio.Event,
-        concurrency: int = 8,
-    ) -> None:
-        """Continuously sample tasks, generate, and push trajectories into the store.
-
-        Tasks are cycled rather than exhausted: with 120 training tasks and a long run the
-        same task is revisited many times. That is fine, and is not the same as reusing a
-        trajectory -- each visit draws a fresh completion from the current policy, which is
-        new gradient signal.
-        """
-        semaphore = asyncio.Semaphore(concurrency)
-
-        async def one(task: Task, version: int) -> None:
-            async with semaphore:
-                try:
-                    result = await self.generate(task)
-                except Exception:  # noqa: BLE001 -- one bad rollout must not kill the worker
-                    logger.exception("rollout failed for task %s", task.task_id)
-                    return
-                # The hint must exist before the trajectory is stored: a trajectory with no
-                # hint gives the teacher the bare query, making it identical to the student
-                # and its gradient ~zero. Dropping it keeps the batch meaningful at the
-                # cost of a wasted generation.
-                hint = await self._error_hint(task, result.text)
-                if not hint:
-                    self.hintless_dropped += 1
-                    logger.warning(
-                        "dropping rollout for task %s: no hint could be generated",
-                        task.task_id,
-                    )
-                    return
-                await store.add(
-                    Trajectory(
-                        task_id=result.task_id,
-                        prompt_token_ids=result.prompt_token_ids,
-                        response_token_ids=result.response_token_ids,
-                        rollout_logprobs=result.logprobs,
-                        # Tagged with the version that GENERATED it, not the version
-                        # current when it lands. This is what makes staleness measurable.
-                        policy_version=version,
-                        hint=hint,
-                    )
-                )
-
-        index = 0
-        pending: set[asyncio.Task] = set()
-        while not stop_event.is_set():
-            task = tasks[index % len(tasks)]
-            index += 1
-            pending.add(asyncio.create_task(one(task, self.policy_version)))
-            pending = {t for t in pending if not t.done()}
-            while len(pending) >= concurrency and not stop_event.is_set():
-                await asyncio.sleep(0.05)
-                pending = {t for t in pending if not t.done()}
-
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-    # ---- native weight sync ----
+            
+    # ---- native weight sync (receive side) ----
 
     async def init_weight_update_group(
         self, master_address: str, master_port: int, rank_offset: int, world_size: int
     ) -> None:
-        """Join every vLLM GPU worker in this engine to the trainer's NCCL group.
 
-        `rank_offset` is this engine's first rank in the group. Each engine contributes
-        `tensor_parallel_size` ranks -- one per GPU worker, NOT one per engine -- so the
-        offsets must be spaced by TP size and `world_size` must count GPU workers, not
-        engines. Rank 0 is the trainer (the sender).
-        """
         from vllm.distributed.weight_transfer.base import WeightTransferInitRequest
         from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferInitInfo
 
@@ -282,7 +229,7 @@ class RolloutEngine:
                     )
                 )
             ),
-            timeout=self.config.weight_sync_timeout_s,
+            timeout=self.config.generator.engine.weight_sync_timeout_s,
         )
         self._weight_group_ready = True
         logger.info("joined weight-sync group at rank offset %d", rank_offset)
@@ -304,8 +251,8 @@ class RolloutEngine:
         """Post the receive side for one bucket of weights.
 
         The receivers derive their matching broadcasts from this metadata, so the trainer's
-        send order must match `names` exactly. Must be IN FLIGHT before the trainer enters
-        `trainer_send_weights` -- the orchestrator handles that interleaving.
+        send order must match `names` exactly. Must be IN FLIGHT before the trainer sends
+        -- the orchestrator handles that interleaving.
         """
         from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
         from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferUpdateInfo
@@ -323,9 +270,7 @@ class RolloutEngine:
     async def finish_update(self, new_version: int) -> None:
         """Close the transaction and resume generation under the new weights."""
         await self.engine.finish_weight_update()
-        # The prefix cache holds KV computed under the OLD weights. Reusing it would splice
-        # two policy versions into a single trajectory, making `policy_version` a lie and
-        # corrupting the staleness accounting the whole design rests on.
+        # We'll reset the prefix cache so that our newly generated sequences are entirely from this policy generation, instead of splicing into 2 policies
         await self.engine.reset_prefix_cache()
         await self.engine.resume_generation()
         self.policy_version = new_version
@@ -335,6 +280,67 @@ class RolloutEngine:
             return
         self.engine.shutdown()  # synchronous, not a coroutine
         self.engine = None
+
+
+class NCCLWeightTransport:
+    """Send side of weight sync, over vLLM's native NCCL weight-transfer group.
+
+    Implements the `WeightTransport` protocol in `train/engine.py`. This code used to live
+    in `train/trainer.py`; it is here so the trainer holds no engine-specific imports and
+    can be paired with any transport.
+    """
+
+    def __init__(self) -> None:
+        self._group = None
+
+    def setup(self, master_address: str, master_port: int, world_size: int) -> None:
+        """Join the weight-transfer group as the SENDER at rank 0.
+
+        `world_size` counts vLLM GPU workers plus one for the trainer -- each rollout engine
+        contributes `tensor_parallel_size` ranks, not one rank per engine. This blocks until
+        every rank has joined, so the rollout engines must already be initializing their
+        side (the orchestrator issues both concurrently).
+        """
+        from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+        logger.info(
+            "weight-sync: opening rendezvous at %s:%d, waiting for %d receiver(s)",
+            master_address, master_port, world_size - 1,
+        )
+        self._group = NCCLWeightTransferEngine.trainer_init(
+            dict(
+                master_address=master_address,
+                master_port=master_port,
+                world_size=world_size,
+            )
+        )
+        logger.info("weight-sync: rendezvous complete, all %d ranks joined", world_size)
+
+    def send_bucket(self, bucket: WeightBucket) -> None:
+        """Broadcast one bucket over the weight-sync group.
+
+        The receivers post their matching broadcasts from the metadata in their
+        `update_weights` request, so send order must match `bucket.names` exactly. Their RPC
+        must already be in flight when this is called, or this blocks on a broadcast nobody
+        is listening for.
+        """
+        if self._group is None:
+            raise RuntimeError("weight sync not initialized; call setup first")
+
+        from vllm.distributed.weight_transfer.nccl_engine import (
+            NCCLTrainerSendWeightsArgs,
+            NCCLWeightTransferEngine,
+        )
+
+        NCCLWeightTransferEngine.trainer_send_weights(
+            iterator=zip(bucket.names, bucket.tensors),
+            trainer_args=NCCLTrainerSendWeightsArgs(group=self._group, packed=True),
+        )
+
+    def teardown(self) -> None:
+        """Drop the group handle. vLLM owns the group lifecycle, so there is nothing to
+        close explicitly -- this only makes a torn-down transport fail loudly if reused."""
+        self._group = None
 
 
 def _extract_sampled_logprobs(completion) -> list[float]:

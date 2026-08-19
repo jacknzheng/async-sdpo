@@ -14,19 +14,13 @@ from train.loss import (
     clip_ratio,
     importance_ratio,
     masked_mean,
-    sdpo_advantage,
     sdpo_loss,
 )
 
-
-def test_advantage_sign_is_teacher_minus_student():
-    """Advantage is positive exactly when the teacher likes the token more."""
-    student = torch.tensor([[-2.0, -1.0]])
-    teacher = torch.tensor([[-1.0, -3.0]])  # likes token 0 more, token 1 less
-    adv = sdpo_advantage(student, teacher)
-    assert adv[0, 0] > 0
-    assert adv[0, 1] < 0
-    assert not adv.requires_grad, "advantage must be detached"
+# NOTE: the standalone `sdpo_advantage` helper is gone -- the advantage is now computed
+# inline in sdpo_loss (train/loss.py:137). Its sign convention is still covered by
+# test_gradient_moves_toward_teacher below, which exercises it end-to-end through a real
+# optimizer step rather than asserting on the intermediate directly.
 
 
 def test_gradient_moves_toward_teacher():

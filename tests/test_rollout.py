@@ -10,7 +10,7 @@ import asyncio
 import pytest
 
 from data.dataset import Task
-from train.rollout import _extract_sampled_logprobs
+from train.backends.vllm import _extract_sampled_logprobs
 from train.store import Trajectory
 
 
@@ -112,7 +112,10 @@ def test_sync_weights_posts_receive_before_sending():
     """
     import asyncio
 
+    import torch
+
     from run import sync_weights
+    from train.backends.backend import WeightBucket
 
     events: list[str] = []
 
@@ -131,12 +134,23 @@ def test_sync_weights_posts_receive_before_sending():
             events.append("finish")
 
     class FakeTrainer:
-        config = type("C", (), {"weight_sync_timeout_s": 5.0})()
+        # Mirrors the real nesting: run.py reads
+        # trainer.config.generator.engine.weight_sync_timeout_s.
+        config = type(
+            "C", (), {"generator": type(
+                "G", (), {"engine": type("E", (), {"weight_sync_timeout_s": 5.0})()},
+            )()},
+        )()
 
         def weight_buckets(self):
-            yield ["w1"], ["bfloat16"], [[2, 2]], ["tensor"]
+            yield WeightBucket(
+                names=["w1"],
+                dtype_names=["bfloat16"],
+                shapes=[[2, 2]],
+                tensors=[torch.zeros(2, 2, dtype=torch.bfloat16)],
+            )
 
-        def send_weight_bucket(self, names, tensors):
+        def send_weight_bucket(self, bucket):
             events.append("send")
 
     class FakeStore:
@@ -157,8 +171,8 @@ def test_sync_weights_posts_receive_before_sending():
 def test_weight_sync_requires_initialized_group():
     import asyncio
 
-    from config import Config
-    from train.rollout import RolloutEngine
+    from train.config import Config
+    from train.backends.vllm import VLLMRolloutEngine as RolloutEngine
 
     engine = RolloutEngine(Config())
     with pytest.raises(RuntimeError, match="weight sync not initialized"):
@@ -168,27 +182,25 @@ def test_weight_sync_requires_initialized_group():
 def test_module_imports_without_vllm_installed():
     """vLLM is imported lazily inside start(), so the package stays importable on a dev
     machine with no GPU -- which is what lets every other test run locally."""
-    import train.rollout as rollout
-    assert hasattr(rollout, "RolloutEngine")
+    import train.backends.vllm as rollout
+    assert hasattr(rollout, "VLLMRolloutEngine")
     # The native weight-transfer API is reached through the engine, so there is no worker
     # extension and no private load_weights call to keep importable.
     for method in ("init_weight_update_group", "pause_for_update",
                    "receive_weight_bucket", "finish_update"):
-        assert hasattr(rollout.RolloutEngine, method), method
+        assert hasattr(rollout.VLLMRolloutEngine, method), method
 
 
 # ---- error-conditioned hint generation (no GPU, no network) ----
 
 def _engine(**overrides):
     """A RolloutEngine with __init__ bypassed -- only the hint state is needed."""
-    from dataclasses import replace as dc_replace
-
-    from config import CONFIG
-    from train.rollout import RolloutEngine
+    from conftest import make_config
+    from train.backends.vllm import VLLMRolloutEngine as RolloutEngine
 
     engine = RolloutEngine.__new__(RolloutEngine)
-    engine.config = dc_replace(CONFIG, **overrides)
-    engine._hint_semaphore = asyncio.Semaphore(engine.config.error_hint_concurrency)
+    engine.config = make_config(**overrides)
+    engine._hint_semaphore = asyncio.Semaphore(engine.config.generator.hint.concurrency)
     engine.hintless_dropped = 0
     return engine
 
@@ -202,7 +214,7 @@ def test_hint_is_returned_for_the_trajectory(monkeypatch):
     async def hint(**kwargs):
         return "LLM HINT"
 
-    monkeypatch.setattr("train.rollout.build_error_hint", hint)
+    monkeypatch.setattr("train.backends.vllm.build_error_hint", hint)
     engine = _engine()
     assert asyncio.run(engine._error_hint(_task(), "draft")) == "LLM HINT"
 
@@ -213,7 +225,7 @@ def test_hint_failure_returns_empty_not_raises(monkeypatch):
     async def boom(**kwargs):
         raise RuntimeError("api down")
 
-    monkeypatch.setattr("train.rollout.build_error_hint", boom)
+    monkeypatch.setattr("train.backends.vllm.build_error_hint", boom)
     engine = _engine()
     assert asyncio.run(engine._error_hint(_task(), "draft")) == ""
 
@@ -226,7 +238,7 @@ def test_hint_receives_the_configured_prompt_variant(monkeypatch):
         seen.update(kwargs)
         return "LLM HINT"
 
-    monkeypatch.setattr("train.rollout.build_error_hint", hint)
+    monkeypatch.setattr("train.backends.vllm.build_error_hint", hint)
     engine = _engine(error_hint_prompt="answer_bearing")
     asyncio.run(engine._error_hint(_task(), "the draft text"))
     assert seen["prompt_variant"] == "answer_bearing"
@@ -248,7 +260,7 @@ def test_hint_concurrency_is_bounded(monkeypatch):
         in_flight -= 1
         return "LLM HINT"
 
-    monkeypatch.setattr("train.rollout.build_error_hint", hint)
+    monkeypatch.setattr("train.backends.vllm.build_error_hint", hint)
     engine = _engine(error_hint_concurrency=2)
 
     async def main():
