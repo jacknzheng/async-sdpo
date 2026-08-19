@@ -10,9 +10,10 @@ import pytest
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from config import Config
+from conftest import make_config
+from train.config import Config
 from data.dataset import Task
-from train.batch import build_batch
+from train.utils import build_batch
 from train.store import Trajectory, TrajectoryStore
 from train.trainer import SDPOTrainer, TrainerState, _slice_batch
 
@@ -53,11 +54,11 @@ def _traj(task_id="1", version=0, n=4) -> Trajectory:
 
 
 def _trainer(config: Config | None = None) -> SDPOTrainer:
-    config = config or Config(batch_size=4, mini_batch_size=2)
+    config = config or make_config(batch_size=4, mini_batch_size=2)
     return SDPOTrainer(
         model=_model(),
         tokenizer=FakeTokenizer(),
-        store=TrajectoryStore(max_staleness=config.max_staleness),
+        store=TrajectoryStore(max_staleness=config.trainer.algorithm.max_staleness),
         config=config,
         tasks_by_id={"1": _task("1"), "2": _task("2")},
         device="cpu",
@@ -99,7 +100,7 @@ def test_loss_decreases_over_repeated_steps():
     """The real integration check: repeatedly stepping on the same batch should pull the
     student toward the teacher, so the loss trends down.
     """
-    trainer = _trainer(Config(batch_size=2, mini_batch_size=2, learning_rate=1e-3))
+    trainer = _trainer(make_config(batch_size=2, mini_batch_size=2, learning_rate=1e-3))
     batch = [_traj(), _traj(task_id="2")]
 
     first = trainer.train_step(batch)["loss"]
@@ -120,11 +121,11 @@ def test_mini_batching_matches_single_batch_gradient():
     """Gradient accumulation over mini-batches must equal the full-batch gradient."""
     trajectories = [_traj(), _traj(task_id="2"), _traj(), _traj(task_id="2")]
 
-    single = _trainer(Config(batch_size=4, mini_batch_size=4))
+    single = _trainer(make_config(batch_size=4, mini_batch_size=4))
     single.train_step(trajectories)
     single_params = [p.detach().clone() for p in single.model.parameters()]
 
-    chunked = _trainer(Config(batch_size=4, mini_batch_size=2))
+    chunked = _trainer(make_config(batch_size=4, mini_batch_size=2))
     chunked.train_step(trajectories)
     chunked_params = [p.detach().clone() for p in chunked.model.parameters()]
 
@@ -220,9 +221,11 @@ def test_weight_buckets_cover_every_parameter_exactly_once():
     expected = [name for name, _ in trainer.model.named_parameters()]
 
     shipped = []
-    for names, dtype_names, shapes, tensors in trainer.weight_buckets():
-        assert len(names) == len(dtype_names) == len(shapes) == len(tensors)
-        shipped.extend(names)
+    for bucket in trainer.weight_buckets():
+        assert len(bucket.names) == len(bucket.dtype_names) == len(bucket.shapes) == len(
+            bucket.tensors
+        )
+        shipped.extend(bucket.names)
 
     assert shipped == expected
 
@@ -231,21 +234,21 @@ def test_weight_buckets_cast_to_bfloat16():
     """The rollout engine runs bf16; sending fp32 would fail the dtype check or double the
     bytes on the wire."""
     trainer = _trainer()
-    for names, dtype_names, shapes, tensors in trainer.weight_buckets():
-        assert all(d == "bfloat16" for d in dtype_names)
-        assert all(t.dtype == torch.bfloat16 for t in tensors)
+    for bucket in trainer.weight_buckets():
+        assert all(d == "bfloat16" for d in bucket.dtype_names)
+        assert all(t.dtype == torch.bfloat16 for t in bucket.tensors)
 
 
 def test_weight_bucket_shapes_match_tensors():
     """Receivers allocate from this metadata; a mismatch corrupts the transfer."""
     trainer = _trainer()
-    for names, dtype_names, shapes, tensors in trainer.weight_buckets():
-        for shape, tensor in zip(shapes, tensors):
+    for bucket in trainer.weight_buckets():
+        for shape, tensor in zip(bucket.shapes, bucket.tensors):
             assert list(tensor.shape) == shape
 
 
 def test_small_bucket_size_produces_multiple_buckets():
-    trainer = _trainer(Config(batch_size=2, mini_batch_size=2, weight_sync_bucket_mb=0))
+    trainer = _trainer(make_config(batch_size=2, mini_batch_size=2, weight_sync_bucket_mb=0))
     assert len(list(trainer.weight_buckets())) > 1
 
 
@@ -257,37 +260,46 @@ def test_weight_bucket_names_survive_torch_compile():
         model=torch.compile(_model()),
         tokenizer=FakeTokenizer(),
         store=TrajectoryStore(max_staleness=3),
-        config=Config(batch_size=4, mini_batch_size=2),
+        config=make_config(batch_size=4, mini_batch_size=2),
         tasks_by_id={"1": _task("1")},
         device="cpu",
     )
-    shipped = [n for names, *_ in trainer.weight_buckets() for n in names]
+    shipped = [n for bucket in trainer.weight_buckets() for n in bucket.names]
     assert shipped and all(not n.startswith("_orig_mod.") for n in shipped)
-    assert trainer._ddp is None  # compiled but not DDP -> no no_sync handle
+    assert trainer._fsdp is None  # compiled but not sharded -> no FSDP handle
 
 
-def test_unwrapped_peels_compile_and_ddp_wrappers():
-    """The full production wrapping is torch.compile(DDP(hf)). Parameter names must come
-    out bare, and the resolved DDP handle (used for no_sync during accumulation) must be
-    found through the compile wrapper -- an isinstance check on the outer model misses it,
-    which skips no_sync and hangs ranks with unequal chunk counts."""
+def test_unwrapped_peels_compile_wrapper_under_fsdp():
+    """The full production wrapping is torch.compile(fully_shard(hf)). Parameter names
+    must come out bare, and the FSDP root (used to detect sharding) must be found through
+    the compile wrapper -- an isinstance check on the outer OptimizedModule misses it.
+
+    Unlike DDP, fully_shard mutates in place rather than wrapping, so there is no
+    `module.` level to peel; this pins that names stay clean for vLLM's receiver."""
     import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
 
     dist.init_process_group(
         "gloo", init_method="tcp://127.0.0.1:29517", world_size=1, rank=0
     )
     try:
-        ddp = torch.nn.parallel.DistributedDataParallel(_model())
+        model = _model()
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("fsdp",))
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+
         trainer = SDPOTrainer(
-            model=torch.compile(ddp),
+            model=torch.compile(model),
             tokenizer=FakeTokenizer(),
             store=TrajectoryStore(max_staleness=3),
-            config=Config(batch_size=4, mini_batch_size=2),
+            config=make_config(batch_size=4, mini_batch_size=2),
             tasks_by_id={"1": _task("1")},
             device="cpu",
         )
-        assert trainer._ddp is ddp
-        shipped = [n for names, *_ in trainer.weight_buckets() for n in names]
+        assert trainer._fsdp is model
+        shipped = [n for bucket in trainer.weight_buckets() for n in bucket.names]
         assert shipped and all(
             not n.startswith(("_orig_mod.", "module.")) for n in shipped
         )
@@ -295,16 +307,60 @@ def test_unwrapped_peels_compile_and_ddp_wrappers():
         dist.destroy_process_group()
 
 
+def test_weight_buckets_gather_sharded_params_to_full_shape():
+    """Under FSDP2 every parameter is a DTensor holding only this rank's shard. If
+    weight_buckets ships that raw, vLLM receives a FRAGMENT of each weight -- which does
+    not crash, it silently generates garbage. Every shipped tensor must be full-shape."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+    from torch.distributed.tensor import DTensor
+
+    dist.init_process_group(
+        "gloo", init_method="tcp://127.0.0.1:29519", world_size=1, rank=0
+    )
+    try:
+        model = _model()
+        full_shapes = {n: tuple(p.shape) for n, p in model.named_parameters()}
+
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("fsdp",))
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+        assert any(isinstance(p.data, DTensor) for p in model.parameters())
+
+        trainer = SDPOTrainer(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            store=TrajectoryStore(max_staleness=3),
+            config=make_config(batch_size=4, mini_batch_size=2),
+            tasks_by_id={"1": _task("1")},
+            device="cpu",
+        )
+        for bucket in trainer.weight_buckets():
+            for name, tensor, shape in zip(bucket.names, bucket.tensors, bucket.shapes):
+                assert not isinstance(tensor, DTensor), f"{name} shipped as a shard"
+                assert tuple(tensor.shape) == full_shapes[name], name
+                assert tuple(shape) == full_shapes[name], name
+    finally:
+        dist.destroy_process_group()
+
+
 def test_send_weight_bucket_requires_setup():
+    from train.backends.backend import WeightBucket
+
     trainer = _trainer()
+    bucket = WeightBucket(
+        names=["w"], dtype_names=["bfloat16"], shapes=[[2]], tensors=[torch.zeros(2)]
+    )
     with pytest.raises(RuntimeError, match="weight sync not initialized"):
-        trainer.send_weight_bucket(["w"], [torch.zeros(2)])
+        trainer.send_weight_bucket(bucket)
 
 
 def test_store_to_trainer_integration():
     """Full path: rollouts land in the store, trainer samples within K=3 and steps."""
     async def run():
-        config = Config(batch_size=4, mini_batch_size=2, max_staleness=3)
+        config = make_config(batch_size=4, mini_batch_size=2, max_staleness=3)
         trainer = _trainer(config)
         store = trainer.store
 
