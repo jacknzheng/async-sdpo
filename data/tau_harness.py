@@ -12,6 +12,9 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -19,6 +22,74 @@ from typing import Any, Awaitable, Callable
 from data.dataset import Task
 
 logger = logging.getLogger(__name__)
+
+# tau2's banking env only checks that these names exist on PATH. That is not
+# enough: GPU pods often install bwrap but seccomp-block `unshare`, so every
+# `shell` call then dies with "Creating new namespace failed: Operation not permitted".
+_SANDBOX_BINS = ("srt", "rg", "bwrap", "socat")
+_BWRAP_PROBE = (
+    "bwrap",
+    "--ro-bind",
+    "/",
+    "/",
+    "--dev",
+    "/dev",
+    "/bin/echo",
+    "bwrap-ok",
+)
+SANDBOX_NAMESPACE_HINT = """
+bwrap cannot create a Linux namespace on this host
+(typically: Creating new namespace failed: Operation not permitted).
+
+This is a container policy issue, not a missing install. Recreate the pod/container
+so nested namespaces are allowed:
+
+  docker:  --privileged
+       or  --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+  RunPod:  Edit Pod -> extra flags -> --privileged, then Start
+  Baseten: request a privileged / unconfined-seccomp workstation
+
+Then `bash scripts/setup_tau2_sandbox.sh` should print bwrap: ok and srt-ok.
+BM25 / dense search still work without this; only the sandboxed shell is dead.
+""".strip()
+
+
+class SandboxNamespaceError(RuntimeError):
+    """Banking `shell` cannot run: binaries missing, or namespaces blocked."""
+
+
+def assert_sandbox_ready(domains: list[str]) -> None:
+    """Fail loud before a tau2 run if banking shell cannot actually execute.
+
+    Skip when banking is not in `domains`, and on macOS (sandbox-exec, not bwrap).
+    """
+    if "banking_knowledge" not in domains:
+        return
+    if sys.platform == "darwin":
+        logger.info("tau2 sandbox: macOS uses sandbox-exec; skipping Linux namespace probe")
+        return
+    missing = [name for name in _SANDBOX_BINS if shutil.which(name) is None]
+    if missing:
+        raise SandboxNamespaceError(
+            "tau2 banking sandbox binaries missing from PATH: "
+            f"{missing}. Run: bash scripts/setup_tau2_sandbox.sh"
+        )
+    try:
+        proc = subprocess.run(
+            _BWRAP_PROBE, capture_output=True, text=True, timeout=10
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise SandboxNamespaceError(
+            f"bwrap namespace probe could not run: {exc}\n\n{SANDBOX_NAMESPACE_HINT}"
+        ) from exc
+    if proc.returncode == 0:
+        logger.info("tau2 sandbox: bwrap namespace probe ok")
+        return
+    err = (proc.stderr or proc.stdout or "").strip()
+    raise SandboxNamespaceError(
+        f"bwrap namespace probe failed (exit {proc.returncode}): {err}\n\n"
+        f"{SANDBOX_NAMESPACE_HINT}"
+    )
 
 DEFAULT_GREETING = "Hi! How can I help you today?"
 AGENT_STOP_TOKEN = "###STOP###"

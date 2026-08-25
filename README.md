@@ -99,16 +99,32 @@ PARALLEL_API_KEY=...     # diligence web_search only
 ```bash
 uv sync --extra knowledge          # tau2 + banking retrieval; also enough for diligence
 bash scripts/setup_tau2_sandbox.sh # banking_knowledge shell tool; skip only if you will
-                                   # never touch banking
-which srt rg bwrap socat           # all four must exist on Linux
+                                   # never touch banking. This script *probes namespaces*,
+                                   # not just `which`.
 uv run pytest tests/ -q            # offline; no GPU
 ```
 
 `setup_tau2_sandbox.sh` installs `@anthropic-ai/sandbox-runtime@0.0.23` plus
 `ripgrep`, `bubblewrap`, `socat`. Retail and airline do not need this.
-`banking_knowledge`'s `shell` tool raises `SandboxRuntimeError` at env construction if
-any of them is missing, and can also die mid-episode (no nested userns, bwrap perms, srt
-crash). Treat banking as the canary: `gold_banking` before the three-domain `gold` run.
+
+**Known failure: `which` is a false green.** tau2 only checks that `srt` / `rg` /
+`bwrap` / `socat` exist on PATH, so env construction succeeds. The banking `shell`
+tool then runs inside `srt` → `bwrap` → `unshare`. GPU pods (RunPod / Baseten /
+default Docker) often install those binaries but **seccomp-block nested namespaces**.
+Every shell call then fails at runtime with:
+
+```
+bwrap: Creating new namespace failed: Operation not permitted
+```
+
+That is container policy, not a missing package. Recreate the pod/container with
+`--privileged`, or `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`.
+On RunPod: Edit Pod → extra flags → `--privileged`, then Start. On Baseten: request a
+privileged / unconfined-seccomp workstation. Confirm with
+`bwrap --ro-bind / / --dev /dev /bin/echo bwrap-ok` and `srt -c 'echo srt-ok'`.
+`run.py` runs this probe at tau2 startup and exits if it fails — do not train through
+a fleet of zero-reward banking episodes. BM25 / dense search still work; only shell
+is dead. Treat `gold_banking` as the canary before the three-domain `gold` run.
 
 ### Launch
 
@@ -269,10 +285,15 @@ During a real run, in order:
 4. **Held-out metric beats the zero-shot baseline.** Tau2: `pass1`. Diligence:
    `judge_score` plus `factual-accuracy` / `analytical-reasoning` / `risk-awareness`.
 
-**Sandbox.** If banking episodes are all reward 0 or env construction throws
-`SandboxRuntimeError`, install the four host binaries, fail loud at startup if they are
-missing, and do not let one broken `shell` call kill the training process. Isolate
-banking (`gold_banking`) rather than taking down the three-domain `gold` run.
+**Sandbox.** Two different failures, do not mix them up:
+
+1. **Missing binaries** (`srt` / `rg` / `bwrap` / `socat`) — `SandboxRuntimeError` at
+   env construction. Run `bash scripts/setup_tau2_sandbox.sh`.
+2. **Namespaces blocked** (the usual GPU-pod case) — binaries exist, `which` is green,
+   then `bwrap: Creating new namespace failed: Operation not permitted`. Recreate the
+   pod `--privileged` / `seccomp=unconfined`. `run.py` probes this at startup and
+   exits. Until the pod is recreated, isolate banking (`gold_banking`) rather than
+   taking down the three-domain `gold` run; BM25/dense still work.
 
 **Do not** flip the SDPO sign, change the clip window to exclude 1.0, filter
 zero-variance groups (`group_size=1`, `keep_failures=True` is the blog finding), or

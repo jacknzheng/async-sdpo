@@ -545,6 +545,16 @@ def main() -> None:
     ctx = setup_run_logging(
         config, sys.argv, rank=rank, smoke=args.smoke, baseline=args.baseline
     )
+    # Rank 0, before NCCL: `which bwrap` is a false green on GPU pods that
+    # seccomp-block unshare. Fail here so we do not spend an hour generating
+    # zero-reward banking episodes.
+    if rank == 0 and config.data.dataset == "tau2":
+        from data.tau_harness import SandboxNamespaceError, assert_sandbox_ready
+
+        try:
+            assert_sandbox_ready(config.data.domains)
+        except SandboxNamespaceError as exc:
+            raise SystemExit(f"tau2 sandbox not usable:\n{exc}") from exc
     if world > 1:
         if world != config.trainer.n_trainer_gpus:
             raise SystemExit(

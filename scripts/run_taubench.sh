@@ -20,6 +20,8 @@
 #
 # Needs: 8x H100, OPENROUTER_API_KEY, WANDB_API_KEY,
 #        `uv sync --extra knowledge`, `bash scripts/setup_tau2_sandbox.sh`
+#        `which` is not enough — bwrap must be able to create namespaces
+#        (--privileged / seccomp=unconfined). run.py probes this and exits.
 # Logs:  /log/<run_name>/{train.log,console.log,args.txt,config.yaml}
 set -euo pipefail
 

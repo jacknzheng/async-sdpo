@@ -15,7 +15,9 @@ import torch
 from data.dataset import Task, wrap_tau2_task
 from data.tau_harness import (
     AgentTurn,
+    SandboxNamespaceError,
     ToolCallSpec,
+    assert_sandbox_ready,
     format_transcript,
     gold_suffix,
     parse_tool_calls,
@@ -258,3 +260,48 @@ def test_banking_knowledge_loads_and_namespaces():
     if titles:
         hint = gold_suffix(wrapped)
         assert "Gold knowledge" in hint
+
+
+def test_sandbox_probe_skips_when_banking_not_in_domains(monkeypatch):
+    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
+    assert_sandbox_ready(["retail", "airline"])
+
+
+def test_sandbox_probe_skips_on_macos(monkeypatch):
+    monkeypatch.setattr("data.tau_harness.sys.platform", "darwin")
+    monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: None)
+    assert_sandbox_ready(["banking_knowledge"])
+
+
+def test_sandbox_probe_missing_binaries(monkeypatch):
+    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
+    monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: None)
+    with pytest.raises(SandboxNamespaceError, match="missing from PATH"):
+        assert_sandbox_ready(["banking_knowledge"])
+
+
+def test_sandbox_probe_namespace_denied(monkeypatch):
+    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
+    monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: f"/usr/bin/{_name}")
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "bwrap: Creating new namespace failed: Operation not permitted"
+
+    monkeypatch.setattr("data.tau_harness.subprocess.run", lambda *a, **k: _Proc())
+    with pytest.raises(SandboxNamespaceError, match="container policy"):
+        assert_sandbox_ready(["banking_knowledge"])
+
+
+def test_sandbox_probe_ok(monkeypatch):
+    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
+    monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: f"/usr/bin/{_name}")
+
+    class _Proc:
+        returncode = 0
+        stdout = "bwrap-ok\n"
+        stderr = ""
+
+    monkeypatch.setattr("data.tau_harness.subprocess.run", lambda *a, **k: _Proc())
+    assert_sandbox_ready(["banking_knowledge"])
