@@ -7,6 +7,32 @@ import os
 import sys
 from pathlib import Path
 
+def _prepend_vllm_cudart() -> None:
+    """vLLM 0.26's PyPI wheel links libcudart.so.13; this box's torch is cu128.
+
+    Without this, `import vllm` fails with `libcudart.so.13: cannot open shared
+    object file`. Changing LD_LIBRARY_PATH after the process has started does
+    not always affect dlopen, so we also preload the .so by absolute path.
+    """
+    import ctypes
+
+    for lib in Path(sys.prefix).glob("lib/python*/site-packages/nvidia/cu13/lib"):
+        if not lib.is_dir():
+            continue
+        cur = os.environ.get("LD_LIBRARY_PATH", "")
+        prefix = str(lib)
+        if prefix not in cur.split(os.pathsep):
+            os.environ["LD_LIBRARY_PATH"] = (
+                f"{prefix}{os.pathsep}{cur}" if cur else prefix
+            )
+        so = lib / "libcudart.so.13"
+        if so.exists():
+            ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+        break
+
+
+_prepend_vllm_cudart()
+
 from train.store import Trajectory
 import argparse
 

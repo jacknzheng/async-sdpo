@@ -32,6 +32,11 @@ export PATH="$ROOT/.venv/bin:$ROOT/node_modules/.bin:$PATH"
 if [[ -d "$ROOT/.deps/tau2-bench/data" ]]; then
   export TAU2_DATA_DIR="${TAU2_DATA_DIR:-$ROOT/.deps/tau2-bench/data}"
 fi
+# vLLM 0.26 PyPI wheel needs libcudart.so.13; torch on this driver is cu128.
+_cu13="$ROOT/.venv/lib/python3.12/site-packages/nvidia/cu13/lib"
+if [[ -d "$_cu13" ]]; then
+  export LD_LIBRARY_PATH="$_cu13${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 MODE="${1:-}"
 if [[ -z "$MODE" || "$MODE" == "-h" || "$MODE" == "--help" ]]; then
