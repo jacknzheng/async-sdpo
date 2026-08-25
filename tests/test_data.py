@@ -81,7 +81,10 @@ def test_teacher_prompt_includes_hint():
 
 def test_teacher_and_student_prompts_differ_only_by_hint():
     task = _fixture_task()
-    assert build_prompt(task, HINT).endswith(build_prompt(task, None))
+    student = build_prompt(task, None)
+    teacher = build_prompt(task, HINT)
+    assert teacher.startswith(student)
+    assert teacher != student
 
 
 
@@ -98,6 +101,36 @@ def test_split_sizes_and_disjointness():
     heldout_ids = {t.task_id for t in heldout}
     assert not (train_ids & heldout_ids)
     assert len(train_ids | heldout_ids) == 150
+
+
+def test_namespaced_ids_split():
+    """Banking-style ids are not ints; the carve must still be 70/27 and disjoint."""
+    tasks = [
+        Task(task_id=f"banking_knowledge:task_{i:03d}", query=f"q{i}", sections=[])
+        for i in range(1, 98)
+    ]
+    train, heldout = split_tasks(tasks, n_heldout=27, seed=0)
+    assert len(train) == 70 and len(heldout) == 27
+    assert not ({t.task_id for t in train} & {t.task_id for t in heldout})
+
+
+def test_wrap_tau2_namespaces_colliding_ids():
+    from types import SimpleNamespace
+
+    from data.dataset import wrap_tau2_task
+
+    retail = wrap_tau2_task(
+        "retail",
+        SimpleNamespace(id="0", user_scenario=SimpleNamespace(instructions="exchange a keyboard")),
+    )
+    airline = wrap_tau2_task(
+        "airline",
+        SimpleNamespace(id="0", user_scenario=SimpleNamespace(instructions="cancel a flight")),
+    )
+    assert retail.task_id == "retail:0"
+    assert airline.task_id == "airline:0"
+    assert retail.domain == "retail"
+    assert airline.domain == "airline"
 
 
 def test_split_is_deterministic_across_calls():

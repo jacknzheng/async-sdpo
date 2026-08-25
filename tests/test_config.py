@@ -81,8 +81,47 @@ def test_adv_ema_decay_must_be_a_fraction():
 
 
 def test_unknown_hint_prompt_rejected():
-    with pytest.raises(ValueError, match="answer_free"):
+    with pytest.raises(ValueError, match="generator.hint.prompt"):
         Config.from_cli_overrides(["generator.hint.prompt=answer_maybe"])
+
+
+def test_mixture_hint_prompt_accepted():
+    cfg = Config.from_cli_overrides(["generator.hint.prompt=mixture"])
+    assert cfg.generator.hint.prompt == "mixture"
+
+
+def test_gold_and_step_hint_prompts_accepted():
+    assert Config.from_cli_overrides(["generator.hint.prompt=gold"]).generator.hint.prompt == "gold"
+    assert (
+        Config.from_cli_overrides(["generator.hint.prompt=step_hint"]).generator.hint.prompt
+        == "step_hint"
+    )
+
+
+def test_default_is_tau2_27b():
+    cfg = Config()
+    assert cfg.data.dataset == "tau2"
+    assert cfg.model.model == "Qwen/Qwen3.8-27B"
+    assert cfg.trainer.gradient_checkpointing is True
+    assert cfg.trainer.mini_batch_size == 4
+    assert cfg.trainer.batch_size == 16
+    assert cfg.generator.engine.max_model_len == 16384
+    assert cfg.generator.hint.prompt == "gold"
+    assert cfg.logging.log_dir == "/log"
+    assert cfg.logging.wandb_enabled is True
+    assert cfg.trainer.algorithm.use_sod is True
+    assert cfg.trainer.algorithm.sod_delta == 0.2
+    assert cfg.data.search_mode == "fast"
+
+
+def test_sod_eps_must_be_positive():
+    with pytest.raises(ValueError, match="sod_eps"):
+        Config.from_cli_overrides(["trainer.algorithm.sod_eps=0"])
+
+
+def test_unknown_search_mode_rejected():
+    with pytest.raises(ValueError, match="search_mode"):
+        Config.from_cli_overrides(["data.search_mode=slow"])
 
 
 def test_zero_hint_concurrency_rejected():

@@ -1,7 +1,5 @@
 """
-=============================================================================
-INVARIANTS A TYPE SIGNATURE CANNOT ENFORCE -- read before writing a backend
-=============================================================================
+Setting up a custom backend
 
 1. POST-PROCESSING LOGPROBS. `generate()` must return, for each sampled token, its
    log-prob under the distribution the sampler ACTUALLY drew from -- after temperature,
@@ -31,8 +29,8 @@ swap out.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
 
 import torch
 
@@ -66,10 +64,12 @@ class WeightBucket:
     def __len__(self) -> int:
         return len(self.names)
 
-# types, bounding what our inference engine methods must include
-@runtime_checkable
-class InferenceEngine(Protocol):
+
+class InferenceEngine(ABC):
     """Generation plus the receive side of weight sync.
+
+    Subclass this and implement every method. A backend missing `finish_update` fails at
+    construction (`TypeError: Can't instantiate abstract class`) rather than mid-run.
 
     `policy_version` is the version of the weights currently loaded. The orchestrator reads
     it when tagging trajectories, so it must be updated by `finish_update`, never earlier --
@@ -79,11 +79,12 @@ class InferenceEngine(Protocol):
 
     policy_version: int
 
+    @abstractmethod
     def start(self) -> None:
         """Build the underlying engine. Separate from __init__ so construction is cheap and
         importable without GPUs (see the lazy-import note in each backend)."""
-        ...
 
+    @abstractmethod
     async def generate(self, task, prompt_token_ids: list[int] | None = None):
         """Generate one completion, returning a `RolloutResult`.
 
@@ -91,8 +92,8 @@ class InferenceEngine(Protocol):
         tokens' own log-probs under the processed sampling distribution, aligned 1:1 with
         the response token ids.
         """
-        ...
 
+    @abstractmethod
     async def init_weight_update_group(
         self, master_address: str, master_port: int, rank_offset: int, world_size: int
     ) -> None:
@@ -102,35 +103,33 @@ class InferenceEngine(Protocol):
         tensor parallelism contributes one rank per GPU worker. `rank_offset` is this
         engine's first rank; rank 0 is the trainer (the sender).
         """
-        ...
 
+    @abstractmethod
     async def pause_for_update(self) -> None:
         """Freeze generation and open the weight-update transaction.
 
         In-flight generations should be suspended rather than aborted where the backend
         supports it, so a long rollout survives the swap and resumes under new weights.
         """
-        ...
 
+    @abstractmethod
     async def receive_weight_bucket(
         self, names: list[str], dtype_names: list[str], shapes: list[list[int]]
     ) -> None:
         """Post the receive side for one bucket. Must be IN FLIGHT before the matching
         send begins -- see invariant 4."""
-        ...
 
+    @abstractmethod
     async def finish_update(self, new_version: int) -> None:
         """Close the transaction, reset the prefix cache (invariant 2), resume generation,
         and set `policy_version = new_version`."""
-        ...
 
+    @abstractmethod
     async def shutdown(self) -> None:
         """Release engine resources. Must be safe to call when never started."""
-        ...
 
 
-@runtime_checkable
-class WeightTransport(Protocol):
+class WeightTransport(ABC):
     """The send side of weight sync, owned by the trainer.
 
     This is the seam that keeps a specific inference engine's collectives out of
@@ -138,19 +137,19 @@ class WeightTransport(Protocol):
     bytes reach the engine is entirely the transport's business.
     """
 
+    @abstractmethod
     def setup(self, master_address: str, master_port: int, world_size: int) -> None:
         """Join the transfer group as the SENDER at rank 0.
 
         Blocks until every rank has joined, so the engine side must already be initializing
         concurrently -- the orchestrator issues both at once.
         """
-        ...
 
+    @abstractmethod
     def send_bucket(self, bucket: WeightBucket) -> None:
         """Broadcast one bucket. Synchronous and blocking: the orchestrator runs it in a
         thread so the event loop stays free to service the receive RPC."""
-        ...
 
+    @abstractmethod
     def teardown(self) -> None:
         """Release transport resources. Must be safe to call when never set up."""
-        ...

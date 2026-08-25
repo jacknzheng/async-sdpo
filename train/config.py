@@ -94,11 +94,6 @@ class BaseConfig(ABC):
 
 @dataclass(frozen=True)
 class ModelConfig(BaseConfig):
-    # 27.78B params. AutoModelForCausalLM resolves this to Qwen3_5ForCausalLM (text-only:
-    # the checkpoint also carries a vision tower, which the causal-LM head drops).
-    # NOTE: hybrid attention -- 3 of every 4 layers are linear/Mamba-style rather than
-    # full attention, so KV-cache and activation behaviour differ from a plain dense
-    # transformer. Needs transformers >= 5.14.
     model: str = "Qwen/Qwen3.8-27B"
     smoke_model: str = "Qwen/Qwen3-0.6B"
     dtype: str = "bfloat16"
@@ -111,17 +106,26 @@ class SamplingParams(BaseConfig):
     max_tokens: int = 1536
 
 
+HINT_PROMPTS = (
+    "answer_free",
+    "answer_bearing",
+    "mixture",
+    "gold",
+    "step_hint",
+)
+
+
 @dataclass(frozen=True)
 class HintConfig(BaseConfig):
-    prompt: str = "answer_free"
+    prompt: str = "gold"
     model: str = "deepseek/deepseek-v4-flash"
     concurrency: int = 8
     timeout: float = 60.0
 
     def __post_init__(self) -> None:
-        if self.prompt not in ("answer_free", "answer_bearing"):
+        if self.prompt not in HINT_PROMPTS:
             raise ValueError(
-                f"generator.hint.prompt must be 'answer_free' or 'answer_bearing', got {self.prompt!r}"
+                f"generator.hint.prompt must be one of {HINT_PROMPTS}, got {self.prompt!r}"
             )
         if self.concurrency < 1:
             raise ValueError("generator.hint.concurrency must be >= 1")
@@ -130,18 +134,11 @@ class HintConfig(BaseConfig):
 @dataclass(frozen=True)
 class InferenceEngineConfig(BaseConfig):
     backend: str = "vllm"
-
-    # 2, not 4: the trainer needs 6 of the 8 GPUs to shard 27B (see n_trainer_gpus).
-    # This directly sets vLLM's tensor_parallel_size, so 27B runs at TP=2 -- ~27 GB of
-    # weights per GPU, leaving the rest for KV cache. Halving the rollout pool cuts
-    # generation throughput, which in off-policy training shows up as higher staleness:
-    # watch store_mean_staleness against algorithm.max_staleness.
-    n_rollout_gpus: int = 2
+    n_rollout_gpus: int = 4 
     gpu_memory_utilization: float = 0.85
-    max_prompt_tokens: int = 2048
-
+    max_prompt_tokens: int = 8192
+    max_model_len: int = 16384
     store_capacity: int = 512
-
     weight_sync_interval: int = 1
     weight_sync_host: str = "127.0.0.1"
     weight_sync_port: int = 51216
@@ -162,6 +159,11 @@ class GeneratorConfig(BaseConfig):
     engine: InferenceEngineConfig = field(default_factory=InferenceEngineConfig)
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     hint: HintConfig = field(default_factory=HintConfig)
+    max_steps: int = 30
+
+    def __post_init__(self) -> None:
+        if self.max_steps < 1:
+            raise ValueError("generator.max_steps must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -190,6 +192,12 @@ class AlgorithmConfig(BaseConfig):
     group_size: int = 1
     keep_failures: bool = True
 
+    # SOD (step-wise OPD reweighting) for multi-step TIR. No-op when a trajectory
+    # has a single step. w_k = min((d_1+eps)/(d_k+eps), 1+delta); see train/loss.py.
+    use_sod: bool = True
+    sod_eps: float = 1e-6
+    sod_delta: float = 0.2
+
     def __post_init__(self) -> None:
         if not self.clip_ratio_low < 1.0 < self.clip_ratio_high:
             raise ValueError(
@@ -198,7 +206,10 @@ class AlgorithmConfig(BaseConfig):
             )
         if not 0.0 < self.adv_ema_decay < 1.0:
             raise ValueError("adv_ema_decay must be in (0, 1)")
-
+        if self.sod_eps <= 0.0:
+            raise ValueError("sod_eps must be > 0")
+        if self.sod_delta < 0.0:
+            raise ValueError("sod_delta must be >= 0")
 
 @dataclass(frozen=True)
 class FSDPConfig(BaseConfig):
@@ -216,17 +227,16 @@ class TrainerConfig(BaseConfig):
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 
-    # 6, not 4: FSDP2 shards model state across the TRAINER ranks, so this count sets the
-    # memory ceiling. Qwen3.8-27B is ~324 GB of weights+grads+Adam state, which is 81
-    # GB/rank on 4 ranks (over an 80 GB H100 before a single activation) but 54 GB/rank on
-    # 6. The two GPUs this leaves for rollout run vLLM at TP=2.
-    n_trainer_gpus: int = 6
-
-    batch_size: int = 32
+    n_trainer_gpus: int = 4
+    batch_size: int = 16             # divisible by 4
     eval_batch_size: int = 16
-    mini_batch_size: int = 16
+    mini_batch_size: int = 4
+
+    gradient_checkpointing: bool = True
+    
     total_steps: int = 500
 
+    # only for non fully-async training setups
     epochs: int = 10
 
     seed: int = 1234
@@ -234,16 +244,50 @@ class TrainerConfig(BaseConfig):
     compile_trainer: bool = True
 
     def __post_init__(self) -> None:
+        if self.n_trainer_gpus < 1:
+            raise ValueError("need at least 1 trainer GPU")
         if self.batch_size % self.mini_batch_size != 0:
             raise ValueError("batch_size must be divisible by mini_batch_size")
+        if self.batch_size % self.n_trainer_gpus != 0:
+            raise ValueError(
+                f"batch_size ({self.batch_size}) must be divisible by n_trainer_gpus "
+                f"({self.n_trainer_gpus}) so each FSDP rank gets an equal shard"
+            )
 
 
 @dataclass(frozen=True)
 class DataConfig(BaseConfig):
+    # "tau2" (banking_knowledge + retail + airline) or "diligence".
+    dataset: str = "tau2"
     dataset_name: str = "paperinstruments/diligence-bench"
     dataset_split: str = "test"
-    n_heldout: int = 30
+    domains: list[str] = field(default_factory=lambda: ["banking_knowledge", "retail", "airline"])
+    # Banking has no official split -- carve this many held-out of 97. Diligence
+    # tests pass n_heldout=30 explicitly; set data.n_heldout=30 when dataset=diligence.
+    n_heldout: int = 27
     split_seed: int = 0
+    retrieval: str = "alltools-qwen"
+    user_llm: str = "openrouter/deepseek/deepseek-v4-flash"
+    # Parallel Search (diligence TIR only). https://docs.parallel.ai/search/search-quickstart
+    search_mode: str = "fast"
+    search_timeout: float = 30.0
+    search_max_chars: int = 12000
+
+    def __post_init__(self) -> None:
+        if self.dataset not in ("tau2", "diligence"):
+            raise ValueError(f"data.dataset must be 'tau2' or 'diligence', got {self.dataset!r}")
+        if self.retrieval != "alltools-qwen":
+            raise ValueError(
+                f"data.retrieval must be 'alltools-qwen' (Qwen embeddings); got {self.retrieval!r}"
+            )
+        if self.search_mode not in ("turbo", "fast", "basic", "advanced"):
+            raise ValueError(
+                f"data.search_mode must be turbo/fast/basic/advanced, got {self.search_mode!r}"
+            )
+        if self.search_timeout <= 0.0:
+            raise ValueError("data.search_timeout must be > 0")
+        if self.search_max_chars < 1:
+            raise ValueError("data.search_max_chars must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -259,7 +303,14 @@ class JudgeConfig(BaseConfig):
 class LoggingConfig(BaseConfig):
     log_interval: int = 1
     checkpoint_interval: int = 50
-    output_dir: str = "runs/sdpo-diligence"
+    output_dir: str = "runs/sdpo-tau2"
+    # Rank-0 writes train.log / args.txt / config.yaml here. Default `/log` on the
+    # 8xH100 box; falls back to ./log if that path is not writable.
+    log_dir: str = "/log"
+    run_name: str = ""
+    wandb_project: str = "sdpo-tau2"
+    wandb_entity: str = ""
+    wandb_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -288,11 +339,10 @@ class Config(BaseConfig):
         for arg in args:
             if arg.startswith("+"):
                 raise ValueError(
-                    f"The '+' prefix for adding new config fields is not supported: {arg!r}. "
-                    "Every field must exist on the dataclasses in train/config.py."
-                )
+                        f"The '+' prefix for adding new config fields is not supported: {arg!r}. "
+                        "Every field must exist on the dataclasses in train/config.py."
+                    )
         return cls.from_dict_config(OmegaConf.from_cli(args))
-
 
 def to_yaml(cfg: Config) -> str:
     return yaml.dump(asdict(cfg), sort_keys=False)

@@ -49,7 +49,7 @@ def _traj(task_id="1", version=0, n=4) -> Trajectory:
         response_token_ids=[10 + i for i in range(n)],
         rollout_logprobs=[-0.7] * n,
         policy_version=version,
-        hint="consider deposit beta and repricing risk",
+        hint_free="consider deposit beta and repricing risk",
     )
 
 
@@ -58,7 +58,6 @@ def _trainer(config: Config | None = None) -> SDPOTrainer:
     return SDPOTrainer(
         model=_model(),
         tokenizer=FakeTokenizer(),
-        store=TrajectoryStore(max_staleness=config.trainer.algorithm.max_staleness),
         config=config,
         tasks_by_id={"1": _task("1"), "2": _task("2")},
         device="cpu",
@@ -89,7 +88,7 @@ def test_teacher_forward_produces_no_gradient():
     batch = trainer.prepare_batch([_traj()]).to("cpu")
     max_r = batch.response_mask.size(1)
 
-    teacher_lp = trainer._teacher_logprobs(batch, max_r)
+    teacher_lp, _, _ = trainer._teacher_logprobs(batch, max_r)
     assert not teacher_lp.requires_grad
 
     student_lp = trainer._student_logprobs(batch, max_r)
@@ -144,9 +143,9 @@ def test_prepare_batch_uses_trajectory_hint():
     carried on the trajectory -- there is no task- or config-level hint to fall back to."""
     trainer = _trainer()
     traj = _traj()
-    traj.hint = "a much longer hint that tokenizes to more tokens than the default one"
+    traj.hint_free = "a much longer hint that tokenizes to more tokens than the default one"
     batch = trainer.prepare_batch([traj])
-    # Teacher prompt is longer than the student prompt because the hint was prepended.
+    # Teacher prompt is longer than the student prompt because the hint was appended.
     assert batch.teacher_attention_mask.sum() > batch.student_attention_mask.sum()
 
 
@@ -158,6 +157,9 @@ def test_slice_batch_preserves_alignment():
     assert sliced.task_ids == ["2"]
     assert sliced.student_input_ids.shape[0] == 1
     assert sliced.response_mask.shape[0] == 1
+    assert sliced.step_ids is not None
+    assert sliced.step_ids.shape[0] == 1
+    torch.testing.assert_close(sliced.step_ids[0], batch.step_ids[1])
 
 
 def test_policy_version_bump():
@@ -259,7 +261,6 @@ def test_weight_bucket_names_survive_torch_compile():
     trainer = SDPOTrainer(
         model=torch.compile(_model()),
         tokenizer=FakeTokenizer(),
-        store=TrajectoryStore(max_staleness=3),
         config=make_config(batch_size=4, mini_batch_size=2),
         tasks_by_id={"1": _task("1")},
         device="cpu",
@@ -293,7 +294,6 @@ def test_unwrapped_peels_compile_wrapper_under_fsdp():
         trainer = SDPOTrainer(
             model=torch.compile(model),
             tokenizer=FakeTokenizer(),
-            store=TrajectoryStore(max_staleness=3),
             config=make_config(batch_size=4, mini_batch_size=2),
             tasks_by_id={"1": _task("1")},
             device="cpu",
@@ -332,7 +332,6 @@ def test_weight_buckets_gather_sharded_params_to_full_shape():
         trainer = SDPOTrainer(
             model=model,
             tokenizer=FakeTokenizer(),
-            store=TrajectoryStore(max_staleness=3),
             config=make_config(batch_size=4, mini_batch_size=2),
             tasks_by_id={"1": _task("1")},
             device="cpu",
@@ -362,17 +361,66 @@ def test_store_to_trainer_integration():
     async def run():
         config = make_config(batch_size=4, mini_batch_size=2, max_staleness=3)
         trainer = _trainer(config)
-        store = trainer.store
+        # The store is the producer's, not the trainer's -- run.py owns it on rank 0 and
+        # hands train_step() a plain list of trajectories.
+        store = TrajectoryStore(max_staleness=config.trainer.algorithm.max_staleness)
 
+        await store.add(_traj(task_id="1", version=-10))  # too stale, must be evicted
         for i in range(3):
             await store.add(_traj(task_id=str((i % 2) + 1), version=0))
-        await store.add(_traj(task_id="1", version=-10))  # too stale, must be evicted
 
         await store.set_policy_version(0)
-        batch = await store.sample(8)
+        batch = await store.get_batch(3)
         return trainer.train_step(batch), store, len(batch)
 
     metrics, store, n = asyncio.run(run())
     assert n == 3, "the over-stale trajectory should have been evicted"
     assert store.stats.evicted_stale == 1
     assert "loss" in metrics and torch.isfinite(torch.tensor(metrics["loss"]))
+
+
+def test_mixture_prepare_batch_attaches_bearing_teacher():
+    trainer = _trainer(make_config(batch_size=2, mini_batch_size=2, error_hint_prompt="mixture"))
+    traj = _traj()
+    traj.hint_free = "short"
+    traj.hint_bearing = "a much longer answer-bearing hint with more tokens"
+    batch = trainer.prepare_batch([traj])
+    assert batch.teacher_bearing_input_ids is not None
+    assert batch.teacher_bearing_input_ids.size(1) > batch.teacher_input_ids.size(1)
+
+
+def test_mixture_teacher_is_mean_of_two_arms():
+    """Averaging KLs == one SDPO pass on 0.5 (log t_b + log t_f), clipper off."""
+    trainer = _trainer(make_config(batch_size=2, mini_batch_size=2, error_hint_prompt="mixture"))
+    traj = _traj()
+    traj.hint_free = "short"
+    traj.hint_bearing = "a much longer answer-bearing hint with more tokens"
+    batch = trainer.prepare_batch([traj]).to("cpu")
+    max_r = batch.response_mask.size(1)
+
+    student_lp = trainer._student_logprobs(batch, max_r)
+    mix, lp_free, lp_bearing = trainer._teacher_logprobs(batch, max_r)
+    assert lp_free is not None and lp_bearing is not None
+    torch.testing.assert_close(mix, 0.5 * (lp_free + lp_bearing))
+
+    from train.loss import sdpo_loss
+
+    mixed_loss, _ = sdpo_loss(
+        student_lp, mix, batch.rollout_logprobs, batch.response_mask, clipper=None
+    )
+    free_loss, _ = sdpo_loss(
+        student_lp, lp_free, batch.rollout_logprobs, batch.response_mask, clipper=None
+    )
+    bearing_loss, _ = sdpo_loss(
+        student_lp, lp_bearing, batch.rollout_logprobs, batch.response_mask, clipper=None
+    )
+    torch.testing.assert_close(mixed_loss, 0.5 * (free_loss + bearing_loss))
+
+
+def test_mixture_train_step_logs_unmixed_gaps():
+    trainer = _trainer(make_config(batch_size=2, mini_batch_size=2, error_hint_prompt="mixture"))
+    traj = _traj()
+    traj.hint_bearing = "different bearing hint"
+    metrics = trainer.train_step([traj])
+    assert "teacher_free_minus_student_logp" in metrics
+    assert "teacher_bearing_minus_student_logp" in metrics

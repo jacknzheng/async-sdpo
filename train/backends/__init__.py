@@ -9,10 +9,10 @@ Backends are imported lazily inside `get_backend` so that `import train.backends
 drag in vLLM (or any future engine's dependencies) on a machine that lacks them. Only the
 backend actually named in config is imported.
 
-To add a backend: implement `InferenceEngine` and `WeightTransport` from `train/engine.py`
-in a new module here and add one line to `_BACKENDS`. Read the invariants at the top of
-`train/engine.py` first -- particularly the processed-logprobs requirement, which a new
-engine can violate silently.
+To add a backend: subclass `InferenceEngine` and `WeightTransport` from
+`train/backends/backend.py` in a new module here and add one line to `_BACKENDS`. Read the
+invariants at the top of `train/backends/backend.py` first -- particularly the
+processed-logprobs requirement, which a new engine can violate silently.
 """
 
 from __future__ import annotations

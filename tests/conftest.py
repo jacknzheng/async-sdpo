@@ -33,6 +33,7 @@ def make_config(**overrides) -> Config:
         "clip_ratio_low": "trainer.algorithm.clip_ratio_low",
         "clip_ratio_high": "trainer.algorithm.clip_ratio_high",
         "adv_ema_decay": "trainer.algorithm.adv_ema_decay",
+        "use_sod": "trainer.algorithm.use_sod",
         # generator.engine
         "n_rollout_gpus": "generator.engine.n_rollout_gpus",
         "rollout_backend": "generator.engine.backend",
@@ -43,8 +44,14 @@ def make_config(**overrides) -> Config:
         "error_hint_concurrency": "generator.hint.concurrency",
         # judge
         "eval_interval": "judge.eval_interval",
+        # data
+        "dataset": "data.dataset",
     }
     unknown = set(overrides) - set(dotted)
     if unknown:
         raise KeyError(f"make_config has no dotted path for {unknown}; add it to conftest.")
+    # CPU unit tests are single-process; default the trainer shard count so a batch_size
+    # of 2 is valid without every call site repeating n_trainer_gpus=1.
+    if "n_trainer_gpus" not in overrides:
+        overrides = {**overrides, "n_trainer_gpus": 1}
     return Config.from_cli_overrides([f"{dotted[k]}={v}" for k, v in overrides.items()])

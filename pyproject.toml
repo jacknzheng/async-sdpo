@@ -17,4 +17,16 @@ dependencies = [
     "torch>=2.4",
     "torchdata>=0.11.0",
     "transformers>=4.45",
+    "wandb>=0.19",
+]
+
+[project.optional-dependencies]
+# Core tau2 (retail / airline / mock). No retrieval, no sandbox.
+tau2 = [
+    "tau2 @ git+https://github.com/sierra-research/tau2-bench.git",
+]
+# Banking_knowledge: BM25 + OpenRouter dense embeddings (qwen3-embedding-8b).
+# The shell tool also needs host binaries -- see scripts/setup_tau2_sandbox.sh.
+knowledge = [
+    "tau2[knowledge] @ git+https://github.com/sierra-research/tau2-bench.git",
 ]

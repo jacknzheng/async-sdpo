@@ -37,7 +37,7 @@ def test_add_and_sample_roundtrip():
         store = TrajectoryStore(capacity=10, max_staleness=3)
         for i in range(4):
             await store.add(_traj(task_id=str(i)))
-        batch = await store.sample(4)
+        batch = await store.get_batch(4)
         return batch
 
     batch = asyncio.run(run())
@@ -45,13 +45,21 @@ def test_add_and_sample_roundtrip():
     assert [t.task_id for t in batch] == ["0", "1", "2", "3"]  # FIFO
 
 
-def test_sample_returns_partial_batch_when_short():
+def test_get_batch_waits_until_filled():
     async def run():
         store = TrajectoryStore()
-        await store.add(_traj())
-        return await store.sample(8)
 
-    assert len(asyncio.run(run())) == 1
+        async def producer():
+            for i in range(4):
+                await asyncio.sleep(0.01)
+                await store.add(_traj(task_id=str(i)))
+
+        task = asyncio.create_task(producer())
+        batch = await store.get_batch(4)
+        await task
+        return batch
+
+    assert len(asyncio.run(run())) == 4
 
 
 def test_staleness_boundary_is_inclusive_at_k3():
@@ -60,10 +68,10 @@ def test_staleness_boundary_is_inclusive_at_k3():
     """
     async def run():
         store = TrajectoryStore(max_staleness=3)
-        for version in (5, 4, 3, 2, 1):   # staleness 0,1,2,3,4 at current version 5
+        for version in (1, 2, 3, 4, 5):   # staleness 4,3,2,1,0 at current version 5
             await store.add(_traj(task_id=str(version), version=version))
         await store.set_policy_version(5)
-        return await store.sample(10), store
+        return await store.get_batch(4), store
 
     batch, store = asyncio.run(run())
     stalenesses = sorted(t.staleness(5) for t in batch)
@@ -71,15 +79,15 @@ def test_staleness_boundary_is_inclusive_at_k3():
     assert store.stats.evicted_stale == 1
 
 
-def test_all_stale_yields_empty_batch():
+def test_all_stale_is_not_ready():
     async def run():
         store = TrajectoryStore(max_staleness=3)
         for _ in range(5):
             await store.add(_traj(version=0))
         await store.set_policy_version(100)
-        return await store.sample(5)
+        return store.ready(1)
 
-    assert asyncio.run(run()) == []
+    assert asyncio.run(run()) is False
 
 
 def test_drop_stale_false_keeps_everything():
@@ -88,7 +96,7 @@ def test_drop_stale_false_keeps_everything():
         store = TrajectoryStore(max_staleness=3)
         await store.add(_traj(version=0))
         await store.set_policy_version(50)
-        return await store.sample(1, drop_stale=False)
+        return await store.get_batch(1, drop_stale=False)
 
     assert len(asyncio.run(run())) == 1
 
@@ -99,7 +107,7 @@ def test_capacity_evicts_oldest_first():
         store = TrajectoryStore(capacity=3)
         for i in range(5):
             await store.add(_traj(task_id=str(i)))
-        return await store.sample(10), store
+        return await store.get_batch(3), store
 
     batch, store = asyncio.run(run())
     assert [t.task_id for t in batch] == ["2", "3", "4"]
@@ -120,33 +128,6 @@ def test_prune_stale_removes_and_counts():
     assert removed == 1 and size == 1
 
 
-def test_wait_for_batch_returns_when_filled():
-    async def run():
-        store = TrajectoryStore()
-
-        async def producer():
-            for i in range(4):
-                await asyncio.sleep(0.01)
-                await store.add(_traj(task_id=str(i)))
-
-        task = asyncio.create_task(producer())
-        batch = await store.wait_for_batch(4, timeout=2.0)
-        await task
-        return batch
-
-    assert len(asyncio.run(run())) == 4
-
-
-def test_wait_for_batch_times_out_with_partial():
-    """On timeout the trainer gets what exists and decides whether to step or keep waiting."""
-    async def run():
-        store = TrajectoryStore()
-        await store.add(_traj())
-        return await store.wait_for_batch(8, timeout=0.05)
-
-    assert len(asyncio.run(run())) == 1
-
-
 def test_version_bump_wakes_waiters():
     """If a version bump makes a pending batch unsatisfiable, waiters must re-evaluate
     rather than hang until timeout."""
@@ -156,19 +137,20 @@ def test_version_bump_wakes_waiters():
         for _ in range(2):
             await store.add(_traj(version=0))
 
-        async def bump():
+        async def refill():
             await asyncio.sleep(0.01)
             await store.set_policy_version(100)  # everything becomes stale
+            for i in range(4):
+                await store.add(_traj(task_id=str(i), version=100))
 
-        task = asyncio.create_task(bump())
-        # Timeout is deliberately long: if the bump doesn't wake the waiter, this hangs
-        # for 5s and the outer wait_for below fails the test.
-        batch = await store.wait_for_batch(4, timeout=5.0)
+        task = asyncio.create_task(refill())
+        batch = await store.get_batch(4)
         await task
-        return batch
+        return batch, store
 
-    # Must return promptly (well under the 5s inner timeout) with an empty batch.
-    assert asyncio.run(asyncio.wait_for(run(), timeout=2.0)) == []
+    batch, store = asyncio.run(asyncio.wait_for(run(), timeout=2.0))
+    assert [t.policy_version for t in batch] == [100, 100, 100, 100]
+    assert store.stats.evicted_stale == 2
 
 
 def test_concurrent_producers_do_not_lose_trajectories():
@@ -189,7 +171,7 @@ def test_metrics_expose_staleness_distribution():
         for version in (5, 4, 3):  # staleness 0, 1, 2
             await store.add(_traj(version=version))
         await store.set_policy_version(5)
-        await store.sample(3)
+        await store.get_batch(3)
         return store.metrics()
 
     metrics = run and asyncio.run(run())

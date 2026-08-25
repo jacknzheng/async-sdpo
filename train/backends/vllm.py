@@ -9,9 +9,7 @@ WEIGHT SYNC uses vLLM's native `vllm.distributed.weight_transfer` API. The engin
 constructed with `WeightTransferConfig(backend="nccl")`, and the update is a four-call
 transaction:
 
-    pause_generation(mode="keep") -> start_weight_update()
-      -> update_weights(...)  [once per bucket]
-      -> finish_weight_update() -> resume_generation()
+    pause_generation(mode="keep") -> start_weight_update() -> update_weights(...)  [once per bucket] -> finish_weight_update() -> resume_generation()
 
 vLLM owns the group lifecycle, the receive side posts its own matching broadcasts from the
 names/dtypes/shapes metadata carried in the request, and bucketing is supported natively
@@ -22,7 +20,8 @@ Ordering still matters: the receivers must have their `update_weights` RPC in fl
 the trainer sends, or the sender blocks on a broadcast nobody is listening for. The
 orchestrator owns that interleaving -- see `run.py:sync_weights`.
 
-Two generation details are correctness-critical (invariants 1 and 2 in `train/engine.py`):
+Two generation details are correctness-critical (invariants 1 and 2 in
+`train/backends/backend.py`):
 
 1. `logprobs_mode="processed_logprobs"`. The IS ratio's denominator must be the log-prob
    under the distribution the sampler ACTUALLY drew from -- after temperature and any
@@ -54,9 +53,8 @@ from dataclasses import asdict, dataclass
 
 from train.config import Config
 from data.dataset import Task, build_prompt
-from data.hint import build_error_hint
-from train.backends.backend import WeightBucket
-from train.store import Trajectory, TrajectoryStore
+from train.models import RolloutResult
+from train.backends.backend import InferenceEngine, WeightBucket, WeightTransport
 
 logger = logging.getLogger(__name__)
 
@@ -64,21 +62,10 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
-@dataclass
-class RolloutResult:
-    """One generation, with the per-token log-probs recorded at sampling time."""
-
-    task_id: str
-    prompt_token_ids: list[int]
-    response_token_ids: list[int]
-    logprobs: list[float]
-    text: str
-
-
-class VLLMRolloutEngine:
+class VLLMRolloutEngine(InferenceEngine):
     """Async wrapper over vLLM's AsyncLLM for off-policy trajectory generation.
 
-    Implements the `InferenceEngine` protocol in `train/engine.py`.
+    Implements the `InferenceEngine` ABC in `train/backends/backend.py`.
     """
 
     def __init__(self, config: Config, model: str | None = None, seed: int = 0) -> None:
@@ -86,12 +73,10 @@ class VLLMRolloutEngine:
         self.model = model or config.model.model
         self.seed = seed
         self.engine = None
+        self.tokenizer = None
         self.policy_version = 0
         self._weight_group_ready = False
         self._request_counter = 0
-        self._hint_semaphore = asyncio.Semaphore(config.generator.hint.concurrency)
-        # Rollouts discarded because no hint could be generated
-        self.hintless_dropped = 0
 
     def start(self) -> None:
         """Build the AsyncLLM engine. vLLM is imported lazily so the rest of the package
@@ -111,10 +96,7 @@ class VLLMRolloutEngine:
             gpu_memory_utilization=self.config.generator.engine.gpu_memory_utilization,
             enforce_eager=False,
             enable_prefix_caching=True,
-            max_model_len=(
-                self.config.generator.engine.max_prompt_tokens
-                + self.config.generator.sampling_params.max_tokens
-            ),
+            max_model_len=self.config.generator.engine.max_model_len,
             seed=self.seed,
             # includes sampling adjustments: top_k, temperature, etc.
             logprobs_mode="processed_logprobs",
@@ -122,6 +104,14 @@ class VLLMRolloutEngine:
         # Synchronous: from_engine_args is not a coroutine, and the engine core process
         # starts in __init__. There is no start()/await to call.
         self.engine = AsyncLLM.from_engine_args(engine_args)
+        try:
+            self.tokenizer = self.engine.get_tokenizer()
+        except Exception:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model, trust_remote_code=True
+            )
         logger.info(
             "rollout engine ready: %s on %d GPU(s)",
             self.model,
@@ -145,68 +135,146 @@ class VLLMRolloutEngine:
             logprobs=0,  # sampled token's own logprob only -- see module docstring
         )
 
+    def _get_tokenizer(self):
+        if self.tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model, trust_remote_code=True
+            )
+        return self.tokenizer
+
+    def _apply_chat_template(self, messages: list[dict], tools: list[dict] | None) -> str:
+        tokenizer = self._get_tokenizer()
+        kwargs: dict = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        try:
+            return tokenizer.apply_chat_template(
+                messages, enable_thinking=False, **kwargs
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(messages, **kwargs)
+
+    def encode_text(self, text: str) -> list[int]:
+        tokenizer = self._get_tokenizer()
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        return list(ids)
+
+    def tokenize_chat(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
+        return self.encode_text(self._apply_chat_template(messages, tools))
+
+    async def _complete(self, prompt, request_id: str):
+        """Run one vLLM generate call; return (prompt_token_ids, completion)."""
+        from vllm import TokensPrompt
+
+        request_input = (
+            TokensPrompt(prompt_token_ids=prompt)
+            if isinstance(prompt, list)
+            else prompt
+        )
+        final_output = None
+        async for output in self.engine.generate(
+            prompt=request_input, sampling_params=self._sampling_params(), request_id=request_id
+        ):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError(f"no output for request {request_id}")
+        if not final_output.outputs:
+            raise RuntimeError(f"request {request_id} finished with no output (aborted?)")
+        return list(final_output.prompt_token_ids), final_output.outputs[0]
+
     # ---- generation ----
 
     async def generate(self, task: Task, prompt_token_ids: list[int] | None = None) -> RolloutResult:
         if self.engine is None:
             raise RuntimeError("engine not started; call start() first")
 
-        from vllm import TokensPrompt
-
         if prompt_token_ids is None:
-            prompt = build_prompt(task, hint=None)
-            request_input = prompt
+            request_input = build_prompt(task, hint=None)
         else:
-            request_input = TokensPrompt(prompt_token_ids=prompt_token_ids)
+            request_input = prompt_token_ids
 
         self._request_counter += 1
         request_id = f"{task.task_id}-{self._request_counter}-{uuid.uuid4().hex[:6]}"
-
-        # vLLM streams cumulative snapshots; the last one holds the full completion.
-        final_output = None
-        async for output in self.engine.generate(
-            prompt=request_input, sampling_params=self._sampling_params(), request_id=request_id
-        ):
-            final_output = output
-
-        if final_output is None:
-            raise RuntimeError(f"no output for request {request_id}")
-        # An aborted request can come back finished but with no completions.
-        if not final_output.outputs:
-            raise RuntimeError(f"request {request_id} finished with no output (aborted?)")
-
-        completion = final_output.outputs[0]
+        prompt_ids, completion = await self._complete(request_input, request_id)
         return RolloutResult(
             task_id=task.task_id,
-            prompt_token_ids=list(final_output.prompt_token_ids),
+            prompt_token_ids=prompt_ids,
             response_token_ids=list(completion.token_ids),
-            logprobs=_extract_sampled_logprobs(completion),
+            logprobs=self._extract_sampled_logprobs(completion),
             text=completion.text,
         )
 
-    async def generate_tir(self, task:Task):
-        pass
+    async def generate_tir(self, task: Task) -> RolloutResult:
+        """Multi-turn TIR: train on vLLM-sampled tokens, mask env/search injections."""
+        if self.engine is None:
+            raise RuntimeError("engine not started; call start() first")
+        from data.tau_harness import parse_tool_calls
+        from data.tau_harness import AgentTurn
 
-    async def _error_hint(self, task: Task, response_text: str) -> str:
-        """Generate the teacher's hint for one rollout. Returns "" if it could not be made.
+        async def generate_turn(messages: list[dict], tools: list[dict] | None) -> AgentTurn:
+            prompt_str = self._apply_chat_template(messages, tools)
+            self._request_counter += 1
+            request_id = f"{task.task_id}-{self._request_counter}-{uuid.uuid4().hex[:6]}"
+            prompt_ids, completion = await self._complete(prompt_str, request_id)
+            text = completion.text or ""
+            tool_calls = parse_tool_calls(text)
+            content = None if tool_calls else text
+            return AgentTurn(
+                token_ids=list(completion.token_ids),
+                logprobs=self._extract_sampled_logprobs(completion),
+                content=content,
+                tool_calls=tool_calls,
+                prompt_token_ids=prompt_ids,
+            )
 
-        Bounded by a semaphore: one LLM call per trajectory, and rollout runs continuously,
-        so an unbounded fan-out would open a call for every in-flight generation at once.
-        """
-        try:
-            async with self._hint_semaphore:
-                return await build_error_hint(
-                    query=task.query,
-                    sections=task.sections,
-                    response_text=response_text,
-                    prompt_variant=self.config.generator.hint.prompt,
-                    model=self.config.generator.hint.model,
-                    timeout=self.config.generator.hint.timeout,
-                )
-        except Exception:  # noqa: BLE001 -- one failed hint must not kill the worker
-            logger.exception("error-hint failed for task %s", task.task_id)
-            return ""
-            
+        if task.domain:
+            from data.tau_harness import run_tau2_episode
+
+            episode = await run_tau2_episode(
+                task,
+                generate_turn=generate_turn,
+                encode=self.encode_text,
+                tokenize_chat=self.tokenize_chat,
+                user_llm=self.config.data.user_llm,
+                retrieval=self.config.data.retrieval,
+                max_steps=self.config.generator.max_steps,
+            )
+            text = episode.transcript
+            score = episode.reward
+        else:
+            from data.diligence_harness import make_search_executor, run_diligence_episode
+
+            episode = await run_diligence_episode(
+                task,
+                generate_turn=generate_turn,
+                encode=self.encode_text,
+                tokenize_chat=self.tokenize_chat,
+                execute_tool=make_search_executor(
+                    mode=self.config.data.search_mode,
+                    timeout=self.config.data.search_timeout,
+                    max_chars=self.config.data.search_max_chars,
+                    client_model=self.model,
+                ),
+                max_steps=self.config.generator.max_steps,
+            )
+            text = episode.transcript
+            score = episode.reward if episode.reward else None
+
+        return RolloutResult(
+            task_id=task.task_id,
+            prompt_token_ids=episode.prompt_token_ids,
+            response_token_ids=episode.response_token_ids,
+            logprobs=episode.rollout_logprobs,
+            text=text,
+            loss_mask=episode.loss_mask,
+            step_spans=episode.step_spans,
+            judge_score=score,
+        ) 
     # ---- native weight sync (receive side) ----
 
     async def init_weight_update_group(
@@ -281,13 +349,44 @@ class VLLMRolloutEngine:
         self.engine.shutdown()  # synchronous, not a coroutine
         self.engine = None
 
+    @staticmethod
+    def _extract_sampled_logprobs(completion) -> list[float]:
+        """Pull the log-prob of each SAMPLED token, aligned 1:1 with `token_ids`.
 
-class NCCLWeightTransport:
+        vLLM returns `logprobs` as one dict per generated position, mapping token_id ->
+        Logprob. With `logprobs=0` the sampled token is the only entry, but we look it up by id
+        rather than taking the sole value, so this stays correct if someone raises `logprobs`
+        to inspect alternatives -- with logprobs>0 the dict holds alternatives too, and taking
+        the most likely one would bias every ratio toward 1. A missing entry would silently
+        misalign the IS ratio, so it raises instead.
+        """
+        if completion.logprobs is None:
+            raise ValueError(
+                "rollout returned no logprobs; SamplingParams(logprobs=...) must be set -- "
+                "they cannot be recomputed later without destroying the off-policy correction"
+            )
+
+        out: list[float] = []
+        for position, token_id in enumerate(completion.token_ids):
+            entry = completion.logprobs[position].get(token_id)
+            if entry is None:
+                raise ValueError(f"sampled token {token_id} missing from its logprob dict")
+            out.append(entry.logprob)
+
+        if len(out) != len(completion.token_ids):
+            raise ValueError(
+                f"extracted {len(out)} logprobs for {len(completion.token_ids)} tokens"
+            )
+        return out
+
+
+
+class NCCLWeightTransport(WeightTransport):
     """Send side of weight sync, over vLLM's native NCCL weight-transfer group.
 
-    Implements the `WeightTransport` protocol in `train/engine.py`. This code used to live
-    in `train/trainer.py`; it is here so the trainer holds no engine-specific imports and
-    can be paired with any transport.
+    Implements the `WeightTransport` ABC in `train/backends/backend.py`. This code used to
+    live in `train/trainer.py`; it is here so the trainer holds no engine-specific imports
+    and can be paired with any transport.
     """
 
     def __init__(self) -> None:
@@ -341,33 +440,3 @@ class NCCLWeightTransport:
         """Drop the group handle. vLLM owns the group lifecycle, so there is nothing to
         close explicitly -- this only makes a torn-down transport fail loudly if reused."""
         self._group = None
-
-
-def _extract_sampled_logprobs(completion) -> list[float]:
-    """Pull the log-prob of each SAMPLED token, aligned 1:1 with `token_ids`.
-
-    vLLM returns `logprobs` as one dict per generated position, mapping token_id ->
-    Logprob. With `logprobs=0` the sampled token is the only entry, but we look it up by id
-    rather than taking the sole value, so this stays correct if someone raises `logprobs`
-    to inspect alternatives -- with logprobs>0 the dict holds alternatives too, and taking
-    the most likely one would bias every ratio toward 1. A missing entry would silently
-    misalign the IS ratio, so it raises instead.
-    """
-    if completion.logprobs is None:
-        raise ValueError(
-            "rollout returned no logprobs; SamplingParams(logprobs=...) must be set -- "
-            "they cannot be recomputed later without destroying the off-policy correction"
-        )
-
-    out: list[float] = []
-    for position, token_id in enumerate(completion.token_ids):
-        entry = completion.logprobs[position].get(token_id)
-        if entry is None:
-            raise ValueError(f"sampled token {token_id} missing from its logprob dict")
-        out.append(entry.logprob)
-
-    if len(out) != len(completion.token_ids):
-        raise ValueError(
-            f"extracted {len(out)} logprobs for {len(completion.token_ids)} tokens"
-        )
-    return out

@@ -28,15 +28,32 @@ def test_vllm_is_a_registered_name():
     assert "vllm" in BACKEND_NAMES
 
 
-def test_backend_classes_satisfy_the_protocols():
-    """runtime_checkable Protocols check method presence, which is exactly the guard we
-    want: a backend missing `finish_update` fails here rather than mid-run."""
+def test_backend_classes_are_abc_instances():
+    """The registered vLLM classes construct as InferenceEngine / WeightTransport."""
     engine_cls, transport_cls = get_backend("vllm")
     # Constructed without start(), so no vLLM import is triggered.
     from train.config import Config
 
     assert isinstance(engine_cls(Config()), InferenceEngine)
     assert isinstance(transport_cls(), WeightTransport)
+
+
+def test_incomplete_backend_cannot_be_constructed():
+    """ABC refuses instantiation until every abstract method is implemented, so a backend
+    missing `finish_update` fails at construction rather than mid-run."""
+
+    class IncompleteEngine(InferenceEngine):
+        def start(self) -> None:
+            pass
+
+    class IncompleteTransport(WeightTransport):
+        def setup(self, master_address, master_port, world_size) -> None:
+            pass
+
+    with pytest.raises(TypeError, match="abstract"):
+        IncompleteEngine()
+    with pytest.raises(TypeError, match="abstract"):
+        IncompleteTransport()
 
 
 # ---- WeightBucket ----
@@ -64,7 +81,7 @@ def test_weight_bucket_len_is_parameter_count():
 # ---- the trainer/transport seam ----
 
 
-class FakeTransport:
+class FakeTransport(WeightTransport):
     """Records what the trainer hands it. Stands in for any real backend."""
 
     def __init__(self) -> None:
@@ -92,7 +109,6 @@ def _trainer_with(transport):
     return SDPOTrainer(
         model=_model(),
         tokenizer=FakeTokenizer(),
-        store=TrajectoryStore(max_staleness=3),
         config=make_config(batch_size=4, mini_batch_size=2),
         tasks_by_id={"1": _task("1")},
         device="cpu",

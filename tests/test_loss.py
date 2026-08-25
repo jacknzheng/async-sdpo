@@ -15,6 +15,7 @@ from train.loss import (
     importance_ratio,
     masked_mean,
     sdpo_loss,
+    sod_step_weights,
 )
 
 # NOTE: the standalone `sdpo_advantage` helper is gone -- the advantage is now computed
@@ -249,4 +250,78 @@ def test_loss_is_finite_under_extreme_staleness():
     loss, _ = sdpo_loss(student, teacher, rollout, mask, clipper=EMAAdvantageClipper())
     loss.backward()
     assert torch.isfinite(loss)
+    assert torch.isfinite(student.grad).all()
+
+
+# ---- SOD step-wise reweighting ----
+
+def test_sod_single_step_matches_unweighted_loss():
+    torch.manual_seed(0)
+    student = torch.randn(2, 5).requires_grad_(True)
+    teacher = torch.randn(2, 5)
+    mask = torch.ones(2, 5)
+    step_ids = torch.zeros(2, 5, dtype=torch.long)
+
+    unweighted, _ = sdpo_loss(student, teacher, None, mask, clipper=None)
+    sod, metrics = sdpo_loss(
+        student, teacher, None, mask, clipper=None,
+        step_ids=step_ids, use_sod=True,
+    )
+    torch.testing.assert_close(sod, unweighted)
+    assert metrics["sod_n_steps"] == 1.0
+    assert metrics["sod_weight_mean"] == 1.0
+
+
+def test_sod_anchors_to_first_step_not_previous():
+    """After a cascade, later equally-bad steps stay down-weighted vs d_1.
+
+    Consecutive-only (d_{k-1}/d_k) would snap back to 1 once d_k ≈ d_{k-1}.
+    """
+    student = torch.zeros(1, 6)
+    teacher = torch.tensor([[1.0, 1.0, 4.0, 4.0, 4.0, 4.0]])
+    step_ids = torch.tensor([[0, 0, 1, 1, 2, 2]])
+    mask = torch.ones(1, 6)
+    w, metrics = sod_step_weights(student, teacher, step_ids, mask, eps=1e-6, delta=0.2)
+    expected_later = (1.0 + 1e-6) / (4.0 + 1e-6)
+    torch.testing.assert_close(w[0, :2], torch.ones(2))
+    torch.testing.assert_close(w[0, 2:], torch.full((4,), expected_later))
+    assert metrics["sod_n_steps"] == 3.0
+
+
+def test_sod_recovery_is_capped():
+    """d_k << d_1 would amplify past 1; clip at 1+delta."""
+    student = torch.zeros(1, 2)
+    teacher = torch.tensor([[1.0, 0.05]])
+    step_ids = torch.tensor([[0, 1]])
+    mask = torch.ones(1, 2)
+    w, _ = sod_step_weights(student, teacher, step_ids, mask, eps=1e-6, delta=0.2)
+    torch.testing.assert_close(w[0, 0], torch.tensor(1.0))
+    torch.testing.assert_close(w[0, 1], torch.tensor(1.2))
+
+
+def test_sod_recovery_restores_weight_toward_d1():
+    student = torch.zeros(1, 3)
+    teacher = torch.tensor([[1.0, 4.0, 1.0]])
+    step_ids = torch.tensor([[0, 1, 2]])
+    mask = torch.ones(1, 3)
+    w, _ = sod_step_weights(student, teacher, step_ids, mask, eps=1e-6, delta=0.2)
+    torch.testing.assert_close(w[0, 0], torch.tensor(1.0))
+    assert w[0, 1].item() < 0.5
+    torch.testing.assert_close(w[0, 2], torch.tensor(1.0), atol=1e-5, rtol=0)
+
+
+def test_sod_weights_do_not_receive_gradient():
+    student = torch.tensor([[0.0, 5.0]], requires_grad=True)
+    teacher = torch.zeros(1, 2)
+    step_ids = torch.tensor([[0, 1]])
+    mask = torch.ones(1, 2)
+    w, _ = sod_step_weights(student, teacher, step_ids, mask)
+    assert not w.requires_grad
+
+    loss, _ = sdpo_loss(
+        student, teacher, None, mask, clipper=None,
+        step_ids=step_ids, use_sod=True,
+    )
+    loss.backward()
+    assert student.grad is not None
     assert torch.isfinite(student.grad).all()

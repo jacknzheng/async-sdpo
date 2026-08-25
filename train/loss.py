@@ -52,7 +52,8 @@ def clip_ratio(
 
 @dataclass
 class EMAAdvantageClipper:
-    """Bounds per-token advantage at a fixed multiple of its running mean magnitude, prevents advantage explosion from rogue tokens.
+    """
+    Bounds per-token advantage at a fixed multiple of its running mean magnitude, prevents advantage explosion from rogue tokens. Must be stateful since it stores the teachers weight update hyperparameters. 
 
         batch_mean = masked_mean(|A_t|)                         # this step, response tokens
         ema        = decay * ema + (1 - decay) * batch_mean
@@ -106,6 +107,54 @@ class EMAAdvantageClipper:
         self.step = state["step"]
 
 
+def sod_step_weights(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    step_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    eps: float = 1e-6,
+    delta: float = 0.2,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Per-token SOD weights. Detached: reliability scores, not a second loss.
+
+    d_k = mean |log π_student - log π_teacher| over trained tokens in step k.
+    w_1 = 1, w_k = min((d_1+eps)/(d_k+eps), 1+delta). The paper's product of
+    consecutive ratios telescopes to this; anchoring to step 1 (not k-1) keeps
+    later equally-bad steps down-weighted after a tool-error cascade.
+    """
+    gap = (student_log_probs - teacher_log_probs).detach().abs()
+    valid = (response_mask > 0) & (step_ids >= 0)
+    ones = torch.ones_like(gap)
+    empty = {"sod_weight_mean": 1.0, "sod_d_mean": 0.0, "sod_n_steps": 1.0}
+    if not bool(valid.any()):
+        return ones, empty
+
+    max_k = int(step_ids[valid].max().item()) + 1
+    if max_k <= 1:
+        return ones, empty
+
+    k_range = torch.arange(max_k, device=gap.device).view(1, 1, max_k)
+    member = valid.unsqueeze(-1) & (step_ids.unsqueeze(-1) == k_range)
+    counts = member.float().sum(dim=1)
+    d = (gap.unsqueeze(-1) * member.float()).sum(dim=1) / counts.clamp(min=1.0)
+    d0 = d[:, :1]
+    d = torch.where(counts > 0, d, d0.expand_as(d))
+    w_steps = ((d0 + eps) / (d + eps)).clamp(max=1.0 + delta)
+    w_steps[:, 0] = 1.0
+    gathered = w_steps.gather(1, step_ids.clamp(min=0, max=max_k - 1))
+    weights = torch.where(valid, gathered, ones)
+
+    present = counts > 0
+    n_present = present.float().sum().clamp(min=1.0)
+    n_steps = present.float().sum(dim=-1).mean()
+    metrics = {
+        "sod_weight_mean": masked_mean(weights, response_mask).item(),
+        "sod_d_mean": ((d * present.float()).sum() / n_present).item(),
+        "sod_n_steps": float(n_steps.item()),
+    }
+    return weights, metrics
+
+
 def sdpo_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -116,6 +165,10 @@ def sdpo_loss(
     clip_high: float = 1.4,
     one_sided: bool = False,
     one_sided_max: float = 2.0,
+    step_ids: torch.Tensor | None = None,
+    use_sod: bool = False,
+    sod_eps: float = 1e-6,
+    sod_delta: float = 0.2,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Off-policy SDPO loss for one batch.
 
@@ -127,6 +180,8 @@ def sdpo_loss(
             None means on-policy (K=0), which skips the IS correction entirely.
         response_mask: [B, T] 1 on generated tokens, 0 on prompt/padding.
         clipper: EMA advantage clipper, updated in place. None disables advantage clipping.
+        step_ids: [B, T] packed TIR step index, -1 on pad. SOD is a no-op for a single step.
+        use_sod: multiply each token's loss by w_k = min((d_1+eps)/(d_k+eps), 1+delta).
 
     Returns:
         (scalar loss, metrics dict). `metrics["teacher_minus_student_logp"]` is the
@@ -163,6 +218,18 @@ def sdpo_loss(
         metrics["ratio_clip_frac_low"] = masked_mean(low_frac, response_mask).item()
         metrics["ratio_clip_frac_high"] = masked_mean(high_frac, response_mask).item()
         per_token_loss = per_token_loss * clipped_ratio
+
+    if use_sod and step_ids is not None:
+        sod_w, sod_metrics = sod_step_weights(
+            student_log_probs,
+            teacher_log_probs,
+            step_ids,
+            response_mask,
+            eps=sod_eps,
+            delta=sod_delta,
+        )
+        per_token_loss = per_token_loss * sod_w
+        metrics.update(sod_metrics)
 
     # surrogate gradient = 1/n ∑ d(log student) (log student - log teacher) - summing over just all tokens in the seq
     # dense gradient = ∑ ∑ d(log student) (log student - log teacher) - summing over all tokens + log_probs of all possible tokens in the seq

@@ -10,8 +10,9 @@ import asyncio
 import pytest
 
 from data.dataset import Task
-from train.backends.vllm import _extract_sampled_logprobs
-from train.store import Trajectory
+from train.backends.vllm import VLLMRolloutEngine
+
+_extract_sampled_logprobs = VLLMRolloutEngine._extract_sampled_logprobs
 
 
 class FakeLogprob:
@@ -141,6 +142,7 @@ def test_sync_weights_posts_receive_before_sending():
                 "G", (), {"engine": type("E", (), {"weight_sync_timeout_s": 5.0})()},
             )()},
         )()
+        staleness_manager = None
 
         def weight_buckets(self):
             yield WeightBucket(
@@ -157,6 +159,9 @@ def test_sync_weights_posts_receive_before_sending():
         async def set_policy_version(self, version):
             events.append(f"version:{version}")
 
+        async def prune_stale(self, staleness_manager=None):
+            events.append("prune")
+
     async def run():
         await sync_weights(FakeTrainer(), FakeEngine(), FakeStore(), 7)
 
@@ -164,7 +169,7 @@ def test_sync_weights_posts_receive_before_sending():
     asyncio.run(asyncio.wait_for(run(), timeout=5.0))
 
     assert events == [
-        "pause", "receive_start", "send", "receive_done", "finish", "version:7"
+        "pause", "receive_start", "send", "receive_done", "finish", "version:7", "prune"
     ], events
 
 
@@ -187,23 +192,11 @@ def test_module_imports_without_vllm_installed():
     # The native weight-transfer API is reached through the engine, so there is no worker
     # extension and no private load_weights call to keep importable.
     for method in ("init_weight_update_group", "pause_for_update",
-                   "receive_weight_bucket", "finish_update"):
+                   "receive_weight_bucket", "finish_update", "generate_tir"):
         assert hasattr(rollout.VLLMRolloutEngine, method), method
 
 
 # ---- error-conditioned hint generation (no GPU, no network) ----
-
-def _engine(**overrides):
-    """A RolloutEngine with __init__ bypassed -- only the hint state is needed."""
-    from conftest import make_config
-    from train.backends.vllm import VLLMRolloutEngine as RolloutEngine
-
-    engine = RolloutEngine.__new__(RolloutEngine)
-    engine.config = make_config(**overrides)
-    engine._hint_semaphore = asyncio.Semaphore(engine.config.generator.hint.concurrency)
-    engine.hintless_dropped = 0
-    return engine
-
 
 def _task():
     return Task(task_id="1", query="Assess the funding base.",
@@ -211,36 +204,52 @@ def _task():
 
 
 def test_hint_is_returned_for_the_trajectory(monkeypatch):
+    from conftest import make_config
+    from data.hint import generate_hint
+
     async def hint(**kwargs):
         return "LLM HINT"
 
-    monkeypatch.setattr("train.backends.vllm.build_error_hint", hint)
-    engine = _engine()
-    assert asyncio.run(engine._error_hint(_task(), "draft")) == "LLM HINT"
+    monkeypatch.setattr("data.hint.build_error_hint", hint)
+    hints = asyncio.run(
+        generate_hint(make_config(error_hint_prompt="answer_free"), _task(), "draft")
+    )
+    assert hints.free == "LLM HINT"
+    assert hints.ok("answer_free")
 
 
 def test_hint_failure_returns_empty_not_raises(monkeypatch):
-    """A failed hint must surface as "" so the caller can drop the rollout, not as an
+    """A failed hint must surface as empty so the caller can drop the rollout, not as an
     exception that kills the worker."""
+    from conftest import make_config
+    from data.hint import generate_hint
+
     async def boom(**kwargs):
         raise RuntimeError("api down")
 
-    monkeypatch.setattr("train.backends.vllm.build_error_hint", boom)
-    engine = _engine()
-    assert asyncio.run(engine._error_hint(_task(), "draft")) == ""
+    monkeypatch.setattr("data.hint.build_error_hint", boom)
+    hints = asyncio.run(
+        generate_hint(make_config(error_hint_prompt="answer_free"), _task(), "draft")
+    )
+    assert hints.free == ""
+    assert not hints.ok("answer_free")
 
 
 def test_hint_receives_the_configured_prompt_variant(monkeypatch):
     """The ablation arm must reach the hint generator."""
+    from conftest import make_config
+    from data.hint import generate_hint
+
     seen = {}
 
     async def hint(**kwargs):
         seen.update(kwargs)
         return "LLM HINT"
 
-    monkeypatch.setattr("train.backends.vllm.build_error_hint", hint)
-    engine = _engine(error_hint_prompt="answer_bearing")
-    asyncio.run(engine._error_hint(_task(), "the draft text"))
+    monkeypatch.setattr("data.hint.build_error_hint", hint)
+    asyncio.run(
+        generate_hint(make_config(error_hint_prompt="answer_bearing"), _task(), "the draft text")
+    )
     assert seen["prompt_variant"] == "answer_bearing"
     assert seen["response_text"] == "the draft text"
     assert seen["query"] == "Assess the funding base."
@@ -249,6 +258,11 @@ def test_hint_receives_the_configured_prompt_variant(monkeypatch):
 def test_hint_concurrency_is_bounded(monkeypatch):
     """One LLM call per trajectory, and rollout runs continuously -- without the semaphore
     this fans out to every in-flight generation at once."""
+    from conftest import make_config
+    from data.hint import generate_hint
+    import data.hint as hint_mod
+
+    hint_mod._HINT_SEM = None
     in_flight = 0
     peak = 0
 
@@ -260,13 +274,47 @@ def test_hint_concurrency_is_bounded(monkeypatch):
         in_flight -= 1
         return "LLM HINT"
 
-    monkeypatch.setattr("train.backends.vllm.build_error_hint", hint)
-    engine = _engine(error_hint_concurrency=2)
+    monkeypatch.setattr("data.hint.build_error_hint", hint)
+    config = make_config(error_hint_concurrency=2, error_hint_prompt="answer_free")
 
     async def main():
-        await asyncio.gather(*(engine._error_hint(_task(), "draft") for _ in range(6)))
+        await asyncio.gather(*(generate_hint(config, _task(), "draft") for _ in range(6)))
 
     asyncio.run(main())
     assert peak <= 2, f"expected at most 2 concurrent hint calls, saw {peak}"
+
+
+def test_mixture_generates_both_hints(monkeypatch):
+    from conftest import make_config
+    from data.hint import generate_hint
+
+    async def hint(**kwargs):
+        return f"HINT-{kwargs['prompt_variant']}"
+
+    monkeypatch.setattr("data.hint.build_error_hint", hint)
+    hints = asyncio.run(
+        generate_hint(make_config(error_hint_prompt="mixture"), _task(), "draft")
+    )
+    assert hints.free == "HINT-answer_free"
+    assert hints.bearing == "HINT-answer_bearing"
+    assert hints.ok("mixture")
+
+
+def test_mixture_not_ok_if_either_hint_empty(monkeypatch):
+    from conftest import make_config
+    from data.hint import generate_hint
+
+    async def hint(**kwargs):
+        if kwargs["prompt_variant"] == "answer_bearing":
+            return ""
+        return "FREE"
+
+    monkeypatch.setattr("data.hint.build_error_hint", hint)
+    hints = asyncio.run(
+        generate_hint(make_config(error_hint_prompt="mixture"), _task(), "draft")
+    )
+    assert hints.free == "FREE"
+    assert hints.bearing == ""
+    assert not hints.ok("mixture")
 
 

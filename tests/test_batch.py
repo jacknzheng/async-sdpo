@@ -13,7 +13,7 @@ while training nothing useful:
 import pytest
 import torch
 
-from train.utils import build_batch, gather_response_logprobs
+from train.utils import build_batch, gather_response_logprobs, packed_step_ids, response_logprobs_from_hidden
 
 # NOTE: the chunked `_TargetLogProbs` autograd function is gone -- gather_response_logprobs
 # now computes response log-probs directly. The two tests that exercised its chunking and
@@ -67,6 +67,59 @@ def test_rollout_logprobs_are_preserved_verbatim():
     trajectory.rollout_logprobs = [-0.1, -0.2, -0.3]
     batch = build_batch([trajectory], [[9]], pad_token_id=0)
     assert batch.rollout_logprobs[0, :3].tolist() == pytest.approx([-0.1, -0.2, -0.3])
+
+
+def test_loss_mask_zeros_injected_tokens():
+    """Tool results / user turns sit in the sequence but must not enter the loss.
+
+    `gather_response_logprobs` left-packs trained positions, so rollout logprobs are
+    packed the same way -- dummy 0.0s at mask-0 slots must not occupy a packed column.
+    """
+    trajectory = Trajectory(
+        task_id="1",
+        prompt_token_ids=[1, 2],
+        response_token_ids=[10, 11, 12, 13],
+        rollout_logprobs=[-0.1, 0.0, -0.3, 0.0],
+        policy_version=0,
+        loss_mask=[1, 0, 1, 0],
+        step_spans=[(0, 1), (2, 3)],
+    )
+    batch = build_batch([trajectory], [[9, 9]], pad_token_id=0)
+
+    assert batch.student_response_mask[0].tolist() == [0, 0, 1, 0, 1, 0]
+    assert batch.student_attention_mask[0].tolist() == [1, 1, 1, 1, 1, 1]
+    assert batch.response_mask[0, :2].tolist() == [1, 1]
+    assert batch.response_mask[0, 2:].abs().sum() == 0
+    assert batch.rollout_logprobs[0, :2].tolist() == pytest.approx([-0.1, -0.3])
+    assert batch.rollout_logprobs[0, 2:].abs().sum() == 0
+    assert batch.step_ids[0, :2].tolist() == [0, 1]
+    assert batch.step_ids[0, 2:].tolist() == [-1, -1]
+
+
+def test_packed_step_ids_skip_injected_holes():
+    ids = packed_step_ids(
+        loss_mask=[1, 0, 1, 1, 0],
+        step_spans=[(0, 1), (2, 4)],
+        n_tokens=5,
+    )
+    assert ids == [0, 1, 1]
+
+
+def test_empty_step_spans_are_step_zero():
+    ids = packed_step_ids(loss_mask=[1, 1, 1], step_spans=[], n_tokens=3)
+    assert ids == [0, 0, 0]
+
+
+def test_loss_mask_length_mismatch_raises():
+    with pytest.raises(ValueError, match="loss_mask length"):
+        Trajectory(
+            task_id="1",
+            prompt_token_ids=[1],
+            response_token_ids=[2, 3],
+            rollout_logprobs=[-0.1, -0.2],
+            policy_version=0,
+            loss_mask=[1],
+        )
 
 
 def test_mismatched_teacher_prompt_count_raises():
@@ -206,3 +259,23 @@ def test_identical_contexts_give_identical_logprobs():
         t, batch.teacher_input_ids, batch.teacher_response_mask, max_r)
 
     torch.testing.assert_close(student_lp, teacher_lp)
+
+
+def test_packed_hidden_matches_full_logits_gather():
+    """response_logprobs_from_hidden must match applying the head to every position then
+    gathering -- otherwise the packed path silently trains a different objective.
+    """
+    torch.manual_seed(0)
+    hidden_size, vocab = 8, 12
+    hidden = torch.randn(2, 6, hidden_size)
+    lm_head = torch.nn.Linear(hidden_size, vocab, bias=False)
+    input_ids = torch.randint(0, vocab, (2, 6))
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 1], [0, 0, 1, 0, 0, 0]], dtype=torch.long
+    )
+    max_r = 4
+    packed = response_logprobs_from_hidden(
+        hidden, lm_head, input_ids, response_mask, max_r
+    )
+    full = gather_response_logprobs(lm_head(hidden), input_ids, response_mask, max_r)
+    torch.testing.assert_close(packed, full)

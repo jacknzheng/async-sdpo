@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -13,14 +14,18 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
+from torch.utils.data import Dataset
+from torchdata.stateful_dataloader import StatefulDataLoader
+
+from typing import Iterable, List, Optional, Set
 
 from train.config import Config
-from data.dataset import Task, build_prompt
+from data.dataset import HINT_SEPARATOR, Task
 from train.backends.backend import WeightBucket, WeightTransport
-from train.loss import EMAAdvantageClipper, sdpo_loss
+from train.loss import EMAAdvantageClipper, masked_mean, sdpo_loss
 from train.store import TrajectoryStore
 
-from train.utils import build_batch, SDPOBatch, gather_response_logprobs
+from train.utils import build_batch, SDPOBatch, response_logprobs_from_hidden
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +52,6 @@ class _RolloutStat:
     running: int = 0
     filtered: int = 0
 
-# TODO: monitor and limit rollouts using this class
 class AsyncStalenessManager:
     """
     Bounds how far generation may run ahead of training, makes sure we don't generate
@@ -139,10 +143,11 @@ class AsyncStalenessManager:
             self._stat.running += 1
 
     async def on_rollout_accepted(self) -> None:
-        # buffers been cleared of 1 sample
+        # get_batch() just drained a trajectory that will be trained on.
         async with self._cond:
             self._stat.accepted += 1
             self._stat.running -= 1
+            self._cond.notify_all()
 
     async def on_rollout_filtered(self) -> None:
         """Reclassify an already-accepted group as filtered when it is dropped from training.
@@ -156,14 +161,14 @@ class AsyncStalenessManager:
             self._cond.notify_all()
 
     async def on_rollout_rejected(self) -> None:
-        """
-        Called when a generation is not accepted, or generation worker runs into error while generating a trajectory.
+        """Generation failed, or a finished trajectory was dropped before training.
 
-        Currently, we do not call this method but instead raise errors. We might need to use this when we want to
-        filter out trajectories.
+        Never counted as accepted, so this only frees the running slot. ``filtered``
+        advances so ``submitted == accepted + filtered + running`` still holds.
         """
         async with self._cond:
             self._stat.running -= 1
+            self._stat.filtered += 1
             self._cond.notify_all()
 
     async def notify_capacity_change(self, new_global_step: int) -> None:
@@ -287,6 +292,7 @@ def build_dataloader(cfg: Config, dataset: Dataset, is_train: bool=True, is_full
             logger.info(f"Total steps: {cfg.trainer.total_steps}")
     else:
         logger.info(f"Validation set size: {len(dataloader)}")
+    return dataloader
 
 @dataclass
 class TrainerState:
@@ -317,27 +323,31 @@ class SDPOTrainer:
         self,
         model,
         tokenizer,
-        store: TrajectoryStore,
         config: Config,
         tasks_by_id: dict[str, Task],
         optimizer: torch.optim.Optimizer | None = None,
         device: torch.device | str = "cuda",
         transport: WeightTransport | None = None,
     ) -> None:
+        # No store here on purpose. The store is PRODUCER state -- it belongs to the
+        # rollout side in run.py, which owns it on rank 0 and hands each rank its batch.
+        # The trainer is model + optimizer only, so every rank constructs an identical one
+        # and train_step() is a pure function of the trajectories it is given.
         self.model = model
         self.tokenizer = tokenizer
-        self.store = store
         self.config = config
         self.tasks_by_id = tasks_by_id
         self.device = device
         # Full activations at mini-batch x ~3.5k tokens exceed 80 GB; checkpointing trades
-        # them for recompute. use_cache is incompatible with checkpointing (and useless
-        # for full-sequence scoring anyway). Non-reentrant is the variant that composes
-        # with DDP without requiring static_graph.
-        self.unwrapped.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-        self.unwrapped.config.use_cache = False
+        # them for recompute
+        if config.trainer.gradient_checkpointing:
+            self.unwrapped.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            self.unwrapped.config.use_cache = False
+        else:
+            self.unwrapped.config.use_cache = True
+
         self.state = TrainerState(
             clipper=EMAAdvantageClipper(
                 mult=config.trainer.algorithm.adv_clip_mult,
@@ -345,12 +355,20 @@ class SDPOTrainer:
                 bias_correction=config.trainer.algorithm.adv_ema_bias_correction,
             )
         )
+        self.staleness_manager = AsyncStalenessManager(
+            # Running includes both in-flight generations and trajectories sitting in the
+            # store until get_batch() accepts them, so this ceiling must be the store
+            # size -- hint.concurrency only bounds the hint LLM, not generation slots.
+            max_concurrent_generation_groups=config.generator.engine.store_capacity,
+            mini_batch_size=config.trainer.mini_batch_size,
+            max_staleness_steps=config.trainer.algorithm.max_staleness,
+        )
         self.optimizer = optimizer or torch.optim.AdamW(
             model.parameters(),
             lr=config.trainer.optimizer.learning_rate,
             weight_decay=config.trainer.optimizer.weight_decay,
         )
-        # The send side of weight sync (train/engine.py:WeightTransport). None on DDP ranks
+        # The send side of weight sync (WeightTransport). None on DDP ranks
         # 1..N-1 and in tests -- only rank 0 pushes weights to the rollout engines.
         self.transport = transport
         # Flipped by setup_weight_sync(); guards against sending before the rendezvous.
@@ -364,60 +382,127 @@ class SDPOTrainer:
 
     @property
     def unwrapped(self):
-        """The bare HF model beneath the wrappers. torch.compile prefixes parameter names
-        with `_orig_mod.` -- vLLM's weight receiver and checkpoints need the real HF names,
+        """
+        The bare HF model beneath the wrappers. torch.compile prefixes parameter names
+        with `_orig_mod.` vLLM's weight receiver and checkpoints need the real HF names,
         so anything that reads names or state dicts must go through here.
 
         Unlike DDP, FSDP2 mutates the module in place instead of wrapping it, so there is
-        no `module.` level to peel: the compile wrapper is the only one left."""
+        no `module.` level to peel: the compile wrapper is the only one left.
+        """
         return getattr(self.model, "_orig_mod", self.model)
 
     # ---- forward passes ----
+    def _response_logprobs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        response_mask: torch.Tensor,
+        max_response: int,
+    ) -> torch.Tensor:
+        # FSDP shards live on these submodules (per-layer fully_shard + root).
+        backbone = self.unwrapped.model
+        hidden = backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        ).last_hidden_state
+        return response_logprobs_from_hidden(
+            hidden,
+            self.unwrapped.lm_head,
+            input_ids,
+            response_mask,
+            max_response,
+        )
 
     def _student_logprobs(self, batch: SDPOBatch, max_response: int) -> torch.Tensor:
-        """
-        Most recent policy model does a forward pass on the PROMPT, generating response log probs
-        """
-        logits = self.model(
-            input_ids=batch.student_input_ids,
-            attention_mask=batch.student_attention_mask,
-        ).logits
-        return gather_response_logprobs(
-            logits, batch.student_input_ids, batch.student_response_mask, max_response
+        return self._response_logprobs(
+            batch.student_input_ids,
+            batch.student_attention_mask,
+            batch.student_response_mask,
+            max_response,
         )
 
-    @torch.no_grad()
-    def _teacher_logprobs(self, batch: SDPOBatch, max_response: int) -> torch.Tensor:
+    def _hint_suffix_ids(self, hint: str) -> list[int]:
+        if not hint:
+            return []
+        return self.tokenizer(
+            f"{HINT_SEPARATOR}{hint}", add_special_tokens=False
+        )["input_ids"]
+
+    def _teacher_prompt_ids(self, trajectory, hint: str) -> list[int]:
+        """Reuse the rollout's prompt ids and append a separately tokenized hint.
+
+        Retokenizing `prompt + hint` as one string can merge tokens at the boundary and
+        diverge from vLLM's `prompt_token_ids`.
         """
-        Most recent policy model does a forward pass on the PROMPT + HINT, generating response log probs
+        return list(trajectory.prompt_token_ids) + self._hint_suffix_ids(hint)
+
+    @torch.inference_mode()
+    def _teacher_logprobs(
+        self, batch: SDPOBatch, max_response: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Teacher log-probs under eval + inference_mode.
+
+        Returns `(loss_teacher, lp_free, lp_bearing)`. Single-arm: extras are None.
+        Mixture: `loss_teacher = 0.5 * (lp_free + lp_bearing)` from one stacked forward.
         """
-        logits = self.model(
-            input_ids=batch.teacher_input_ids,
-            attention_mask=batch.teacher_attention_mask,
-        ).logits
-        return gather_response_logprobs(
-            logits, batch.teacher_input_ids, batch.teacher_response_mask, max_response
-        )
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            if batch.teacher_bearing_input_ids is None:
+                lp = self._response_logprobs(
+                    batch.teacher_input_ids,
+                    batch.teacher_attention_mask,
+                    batch.teacher_response_mask,
+                    max_response,
+                )
+                return lp, None, None
+
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id
+            ids, attn, resp = _stack_teacher_sequences(batch, pad_id)
+            lp_all = self._response_logprobs(ids, attn, resp, max_response)
+            n = batch.teacher_input_ids.size(0)
+            lp_free, lp_bearing = lp_all[:n], lp_all[n:]
+            return 0.5 * (lp_free + lp_bearing), lp_free, lp_bearing
+        finally:
+            if was_training:
+                self.model.train()
 
     def prepare_batch(self, trajectories):
-        """
-        Tokenize hint-prefixed teacher prompts and assemble padded tensors.
+        """Assemble padded tensors. Teacher prompt ids = rollout prompt + tokenized hint.
 
-        The hint is read from the trajectory, not from current config, so a mid-run hint
-        change can't mix two different teachers into one batch.
+        Hints are read from the trajectory, not from current config, so a mid-run hint
+        change can't mix two different teachers into one batch. Mixture attaches a second
+        (answer-bearing) teacher sequence on the batch.
         """
-        teacher_prompt_ids = []
-        for trajectory in trajectories:
-            task = self.tasks_by_id[trajectory.task_id]
-            teacher_prompt = build_prompt(task, hint=trajectory.hint)
-            teacher_prompt_ids.append(
-                self.tokenizer(teacher_prompt, add_special_tokens=False)["input_ids"]
-            )
-
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
-        return build_batch(trajectories, teacher_prompt_ids, pad_token_id=pad_id)
+        mode = self.config.generator.hint.prompt
+
+        if mode == "answer_bearing":
+            teacher_ids = [
+                self._teacher_prompt_ids(t, t.hint_bearing) for t in trajectories
+            ]
+        else:
+            teacher_ids = [
+                self._teacher_prompt_ids(t, t.hint_free) for t in trajectories
+            ]
+        batch = build_batch(trajectories, teacher_ids, pad_token_id=pad_id)
+
+        if mode == "mixture":
+            bearing_ids = [
+                self._teacher_prompt_ids(t, t.hint_bearing) for t in trajectories
+            ]
+            bearing_batch = build_batch(trajectories, bearing_ids, pad_token_id=pad_id)
+            batch.teacher_bearing_input_ids = bearing_batch.teacher_input_ids
+            batch.teacher_bearing_attention_mask = bearing_batch.teacher_attention_mask
+            batch.teacher_bearing_response_mask = bearing_batch.teacher_response_mask
+
+        return batch
 
     def train_step(self, trajectories) -> dict[str, float]:
         """One optimizer step over a batch, run in mini-batches for memory."""
@@ -429,34 +514,20 @@ class SDPOTrainer:
         max_response = batch.response_mask.size(1)
 
         self.optimizer.zero_grad(set_to_none=True)
-        accumulated: dict[str, float] = defaultdict()
+        accumulated: dict[str, float] = defaultdict(float)
         n_micro = 0
 
-        # splits the batch (e.g. 256) into mini_batch_size to be trained on each GPU (e.g. 64 on 4 GPUs)
+        # Chunk this rank's batch into minibatches - they'll be processed sequentially
         starts = list(range(0, len(trajectories), self.config.trainer.mini_batch_size))
 
         for start in starts:
             end = min(start + self.config.trainer.mini_batch_size, len(trajectories))
             micro = _slice_batch(batch, start, end)
 
-            # NOTE: deliberately no no_sync()/set_requires_gradient_sync() here -- every
+            # NOTE: deliberately no no_sync()/set_requires_gradient_sync() here, every
             # micro-batch reduce-scatters its gradients.
-            #
-            # DDP's no_sync() was free: DDP all-reduces, so gradients are full-size on
-            # every rank either way and skipping the collective only saved latency. Under
-            # FSDP2 the collective is a reduce-scatter, and the scatter is what makes
-            # gradients small in the first place. Gradients are born FULL-size (each rank
-            # runs a complete forward on its own micro-batch); reduce-scatter is what sums
-            # them across ranks and leaves each rank holding only its 1/N slice. Defer the
-            # sync and you skip the sharding too, so the full-size gradient sits in .grad
-            # for the whole accumulation loop: at 27B on 6 ranks that is 54 GB/rank of
-            # gradients instead of 9, which does not fit alongside weights and Adam state.
-            #
-            # The extra collectives cost less than their count suggests: FSDP2 overlaps
-            # communication with compute on separate CUDA streams, so a layer's
-            # reduce-scatter mostly hides behind the previous layer's backward.
             student_lp = self._student_logprobs(micro, max_response)
-            teacher_lp = self._teacher_logprobs(micro, max_response)
+            teacher_lp, lp_free, lp_bearing = self._teacher_logprobs(micro, max_response)
 
             loss, metrics = sdpo_loss(
                 student_log_probs=student_lp,
@@ -468,7 +539,18 @@ class SDPOTrainer:
                 clip_high=self.config.trainer.algorithm.clip_ratio_high,
                 one_sided=self.config.trainer.algorithm.use_one_sided_clip,
                 one_sided_max=self.config.trainer.algorithm.one_sided_clip_max,
+                step_ids=micro.step_ids,
+                use_sod=self.config.trainer.algorithm.use_sod,
+                sod_eps=self.config.trainer.algorithm.sod_eps,
+                sod_delta=self.config.trainer.algorithm.sod_delta,
             )
+            if lp_free is not None and lp_bearing is not None:
+                metrics["teacher_free_minus_student_logp"] = masked_mean(
+                    (lp_free - student_lp).detach(), micro.response_mask
+                ).item()
+                metrics["teacher_bearing_minus_student_logp"] = masked_mean(
+                    (lp_bearing - student_lp).detach(), micro.response_mask
+                ).item()
 
             # Scale so the summed gradient equals the full-batch mean. Still correct with
             # per-chunk sync: reduce-scatter sums across ranks and each rank accumulates
@@ -486,6 +568,7 @@ class SDPOTrainer:
         )
         self.optimizer.step()
         self.state.step += 1
+        
 
         # The EMA must agree across ranks or they clip differently and slowly diverge.
         self._sync_clipper()
@@ -531,6 +614,10 @@ class SDPOTrainer:
 
         for name, param in self.unwrapped.named_parameters():
             tensor = param.data
+
+            # DTensor is a tensor with metadata being 1024x1024, but the actual tensor in memory is 256x1024 for example
+            # DTensor also holds metadata like which GPU the tensor belongs to, so Mesh can track it when colocation is necessary
+            # DTensor allows broadcasting to be easier, easier to colocate the full weight tensor aftre the fact
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
             bucket.append((name, tensor))
@@ -627,8 +714,48 @@ def _pack_bucket(bucket: list[tuple[str, torch.Tensor]]) -> WeightBucket:
     )
 
 
+def _pad_seq(tensor: torch.Tensor, length: int, value: int | float) -> torch.Tensor:
+    if tensor.size(1) >= length:
+        return tensor
+    pad = tensor.new_full((tensor.size(0), length - tensor.size(1)), value)
+    return torch.cat([tensor, pad], dim=1)
+
+
+def _stack_teacher_sequences(batch: SDPOBatch, pad_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cat free then bearing teachers along the batch dim, padding seq length."""
+    assert batch.teacher_bearing_input_ids is not None
+    assert batch.teacher_bearing_attention_mask is not None
+    assert batch.teacher_bearing_response_mask is not None
+    length = max(batch.teacher_input_ids.size(1), batch.teacher_bearing_input_ids.size(1))
+    ids = torch.cat(
+        [
+            _pad_seq(batch.teacher_input_ids, length, pad_id),
+            _pad_seq(batch.teacher_bearing_input_ids, length, pad_id),
+        ],
+        dim=0,
+    )
+    attn = torch.cat(
+        [
+            _pad_seq(batch.teacher_attention_mask, length, 0),
+            _pad_seq(batch.teacher_bearing_attention_mask, length, 0),
+        ],
+        dim=0,
+    )
+    resp = torch.cat(
+        [
+            _pad_seq(batch.teacher_response_mask, length, 0),
+            _pad_seq(batch.teacher_bearing_response_mask, length, 0),
+        ],
+        dim=0,
+    )
+    return ids, attn, resp
+
+
 def _slice_batch(batch: SDPOBatch, start: int, end: int) -> SDPOBatch:
     """Slice a batch along the batch dimension for gradient accumulation."""
+    def _slice(t: torch.Tensor | None) -> torch.Tensor | None:
+        return None if t is None else t[start:end]
+
     return SDPOBatch(
         student_input_ids=batch.student_input_ids[start:end],
         student_attention_mask=batch.student_attention_mask[start:end],
@@ -640,6 +767,10 @@ def _slice_batch(batch: SDPOBatch, start: int, end: int) -> SDPOBatch:
         response_mask=batch.response_mask[start:end],
         task_ids=batch.task_ids[start:end],
         policy_versions=batch.policy_versions[start:end],
+        step_ids=_slice(batch.step_ids),
+        teacher_bearing_input_ids=_slice(batch.teacher_bearing_input_ids),
+        teacher_bearing_attention_mask=_slice(batch.teacher_bearing_attention_mask),
+        teacher_bearing_response_mask=_slice(batch.teacher_bearing_response_mask),
     )
 
 
@@ -664,6 +795,6 @@ def log_metrics(metrics: dict[str, float], store: TrajectoryStore) -> None:
             "teacher-student gap is ~0 (%.6f): the hint is not making the teacher better "
             "than the student, so the SDPO gradient has vanished and training will not "
             "move. Try generator.hint.prompt='answer_bearing' for a stronger teacher "
-            "(see data/hint.py).",
+            "(see data/prompts/).",
             gap,
         )
