@@ -211,11 +211,11 @@ def test_valid_response_parses(monkeypatch):
 
 
 def test_request_payload_is_correct(monkeypatch):
-    gen, sent = _generator(monkeypatch, [_ok()], model="deepseek/deepseek-v4-flash")
+    gen, sent = _generator(monkeypatch, [_ok()], model="stealth/ox-alpha")
     asyncio.run(gen("SYSTEM PROMPT", "USER PROMPT"))
 
     payload = json.loads(sent[0]["data"])
-    assert payload["model"] == "deepseek/deepseek-v4-flash"
+    assert payload["model"] == "stealth/ox-alpha"
     # A non-deterministic judge would inject sampling noise into the eval curve itself.
     assert payload["temperature"] == 0.0
     assert payload["reasoning"] == {"enabled": True}

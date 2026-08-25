@@ -107,7 +107,7 @@ for the first ~100 steps — exactly when training is least stable.
 
 ## Hints are error-conditioned
 
-Every hint is written **per rollout** by an LLM (`deepseek/deepseek-v4-flash` on OpenRouter)
+Every hint is written **per rollout** by an LLM (`stealth/ox-alpha` on OpenRouter)
 that reads the draft the student actually produced, compares it against the rubric, and names
 where *that* draft fell short. Two rollouts of the same task get different hints: one that
 missed the funding-risk angle is told about funding risk; one that missed the margin math is

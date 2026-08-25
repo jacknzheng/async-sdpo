@@ -118,7 +118,7 @@ HINT_PROMPTS = (
 @dataclass(frozen=True)
 class HintConfig(BaseConfig):
     prompt: str = "gold"
-    model: str = "deepseek/deepseek-v4-flash"
+    model: str = "stealth/ox-alpha"
     concurrency: int = 8
     timeout: float = 60.0
 
@@ -267,7 +267,7 @@ class DataConfig(BaseConfig):
     n_heldout: int = 27
     split_seed: int = 0
     retrieval: str = "alltools-qwen"
-    user_llm: str = "openrouter/deepseek/deepseek-v4-flash"
+    user_llm: str = "openrouter/stealth/ox-alpha"
     # Parallel Search (diligence TIR only). https://docs.parallel.ai/search/search-quickstart
     search_mode: str = "fast"
     search_timeout: float = 30.0
@@ -292,7 +292,7 @@ class DataConfig(BaseConfig):
 
 @dataclass(frozen=True)
 class JudgeConfig(BaseConfig):
-    model: str = "deepseek/deepseek-v4-flash"
+    model: str = "stealth/ox-alpha"
     max_concurrency: int = 8
     max_retries: int = 3
     timeout: float = 120.0

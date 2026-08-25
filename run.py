@@ -30,6 +30,12 @@ from torch.distributed.fsdp import (
 # environment when it constructs its generator.
 load_dotenv()
 
+# tau2 reads TAU2_DATA_DIR at import. The pip package does not ship `data/`, so we
+# keep a sparse clone of the pinned tau2-bench commit next to the repo.
+_tau2_data = Path(__file__).resolve().parent / ".deps" / "tau2-bench" / "data"
+if _tau2_data.is_dir():
+    os.environ.setdefault("TAU2_DATA_DIR", str(_tau2_data))
+
 # Persistent caches, BEFORE the project imports below: huggingface_hub reads HF_HOME at
 # import time, and the vLLM engine processes rank 0 spawns inherit this environment.
 # /workspace is RunPod's volume disk -- it survives pod stop/start, so everything cached

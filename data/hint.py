@@ -55,7 +55,7 @@ async def build_error_hint(
     sections: list[dict] | None = None,
     response_text: str = "",
     prompt_variant: str = "answer_free",
-    model: str = "deepseek/deepseek-v4-flash",
+    model: str = "stealth/ox-alpha",
     timeout: float = 60.0,
     max_retries: int = 2,
     user_prompt: str | None = None,

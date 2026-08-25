@@ -214,7 +214,7 @@ class OpenRouterOneShotGenerator:
 
     def __init__(
         self,
-        model: str = "deepseek/deepseek-v4-flash",
+        model: str = "stealth/ox-alpha",
         max_retries: int = 3,
         max_tokens: int = 16000,
         timeout: float = 120.0,
@@ -246,7 +246,7 @@ class RubricJudge:
 
     def __init__(
         self,
-        model: str = "deepseek/deepseek-v4-flash",
+        model: str = "stealth/ox-alpha",
         max_concurrency: int = 8,
         max_retries: int = 3,
         timeout: float = 120.0,

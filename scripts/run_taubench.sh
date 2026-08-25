@@ -25,6 +25,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+export PATH="$ROOT/.venv/bin:$ROOT/node_modules/.bin:$PATH"
+if [[ -d "$ROOT/.deps/tau2-bench/data" ]]; then
+  export TAU2_DATA_DIR="${TAU2_DATA_DIR:-$ROOT/.deps/tau2-bench/data}"
+fi
 
 MODE="${1:-}"
 if [[ -z "$MODE" || "$MODE" == "-h" || "$MODE" == "--help" ]]; then
@@ -77,8 +81,11 @@ case "$MODE" in
 esac
 
 if command -v uv >/dev/null 2>&1 && [[ -x "$ROOT/.venv/bin/python" || -f "$ROOT/pyproject.toml" ]]; then
-  PY=(uv run python)
-  TORCHRUN=(uv run torchrun)
+  # --no-sync: the lockfile's torch is CUDA 13; this box is driver 12.8. A
+  # sync would replace the cu128 stack (and vLLM) and break CUDA again.
+  export UV_NO_SYNC=1
+  PY=(uv run --no-sync python)
+  TORCHRUN=(uv run --no-sync torchrun)
 else
   PY=(python)
   TORCHRUN=(torchrun)
