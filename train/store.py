@@ -77,30 +77,38 @@ class TrajectoryStore:
         staleness_manager=None,
         drop_stale: bool = True,
     ) -> list[Trajectory]:
-        """Wait until `batch_size` fresh trajectories exist, then drain them."""
-        async with self._not_empty:
-            batch: list[Trajectory] = []
-            while len(batch) < batch_size:
+        """Wait until `batch_size` fresh trajectories exist, then drain them.
+
+        Staleness-manager updates run *after* releasing the store lock. Awaiting
+        them while holding `_not_empty` lets a woken producer block on `add()`
+        and freezes the consumer.
+        """
+        batch: list[Trajectory] = []
+        while len(batch) < batch_size:
+            newly: list[Trajectory] = []
+            rejected = 0
+            async with self._not_empty:
                 n = batch_size - len(batch)
                 await self._not_empty.wait_for(
                     lambda n=n, drop_stale=drop_stale: self.ready(n, drop_stale=drop_stale)
                 )
-                while self._buffer and len(batch) < batch_size:
+                while self._buffer and len(newly) + len(batch) < batch_size:
                     trajectory = self._buffer.popleft()
                     staleness = trajectory.staleness(self.policy_version)
                     if drop_stale and staleness > self.max_staleness:
                         self.stats.evicted_stale += 1
-                        # Never reached training, so this is a reject, not a
-                        # post-accept filter.
-                        if staleness_manager is not None:
-                            await staleness_manager.on_rollout_rejected()
+                        rejected += 1
                         continue
                     self.stats.staleness_histogram[staleness] += 1
-                    batch.append(trajectory)
-                    if staleness_manager is not None:
-                        await staleness_manager.on_rollout_accepted()
-            self.stats.sampled += len(batch)
-            return batch
+                    newly.append(trajectory)
+            if staleness_manager is not None:
+                for _ in range(rejected):
+                    await staleness_manager.on_rollout_rejected()
+                for _ in newly:
+                    await staleness_manager.on_rollout_accepted()
+            batch.extend(newly)
+        self.stats.sampled += len(batch)
+        return batch
 
     async def set_policy_version(self, version: int) -> None:
         """Bump the policy version after a weight sync. Existing trajectories get staler"""
@@ -120,10 +128,10 @@ class TrajectoryStore:
             removed = len(self._buffer) - len(keep)
             self._buffer = deque(keep)
             self.stats.evicted_stale += removed
-            if staleness_manager is not None:
-                for _ in range(removed):
-                    await staleness_manager.on_rollout_rejected()
-            return removed
+        if staleness_manager is not None:
+            for _ in range(removed):
+                await staleness_manager.on_rollout_rejected()
+        return removed
 
     def __len__(self) -> int:
         return len(self._buffer)

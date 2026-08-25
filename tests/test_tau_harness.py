@@ -18,6 +18,7 @@ from data.tau_harness import (
     SandboxNamespaceError,
     ToolCallSpec,
     assert_sandbox_ready,
+    env_kwargs_for,
     format_transcript,
     gold_suffix,
     parse_tool_calls,
@@ -48,6 +49,19 @@ def test_parse_qwen_tool_calls():
 def test_parse_skips_malformed_blocks():
     assert parse_tool_calls("<tool_call>not json</tool_call>") == []
     assert parse_tool_calls("no tools here") == []
+
+
+def test_env_kwargs_carry_solo_mode_so_evaluate_simulation_must_not():
+    """Passing solo_mode both as a kwarg and inside env_kwargs TypeErrors and
+    zeros retail/airline reward in the evaluate_episode except-handler."""
+    retail = Task(task_id="r", query="x", sections=[], domain="retail", tau2_task=object())
+    banking = Task(
+        task_id="b", query="x", sections=[], domain="banking_knowledge", tau2_task=object()
+    )
+    assert env_kwargs_for(retail) == {"solo_mode": False}
+    banking_kw = env_kwargs_for(banking)
+    assert banking_kw["solo_mode"] is False
+    assert "retrieval_variant" in banking_kw
 
 
 def test_episode_masks_injected_spans_and_trains_on_sampled():

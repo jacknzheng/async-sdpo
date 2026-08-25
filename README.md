@@ -172,6 +172,15 @@ same vars at a persistent disk yourself, or every boot re-compiles:
 All are `setdefault`. Also: large `/dev/shm` for vLLM TP workers; pin `vllm==0.26.0`;
 put the venv on persistent disk so the image is not rebuilt every boot.
 
+**Baseten / workstation bringup.** vLLM 0.26.0 is not in `pyproject.toml` — `uv pip install
+vllm==0.26.0` after `uv sync`. That wheel may pull CUDA-13 torchvision/torchaudio; re-pin
+torchvision to cu128 and drop torchaudio. tau2 UserSimulator needs
+`OPENAI_API_KEY=$OPENROUTER_API_KEY` and `OPENAI_API_BASE=https://openrouter.ai/api/v1`
+(`run.py` sets these if only the OpenRouter key is present). Weight-sync on these images
+wants `NCCL_CUMEM_ENABLE=0 NCCL_P2P_DISABLE=1`. Kill leftover vLLM EngineCore processes
+between runs (they pin GPU 0 VRAM). `asyncio.to_thread` weight-sync must
+`torch.cuda.set_device` on the trainer GPU or NCCL binds to cuda:0 (a vLLM worker).
+
 If training misbehaves, `trainer.compile_trainer=false` is the first debug lever.
 `--smoke` already runs uncompiled.
 
@@ -281,7 +290,9 @@ During a real run, in order:
    correction is a no-op; all-unclipped with exploding ratios is the failure the clips
    exist to prevent.
 3. **Staleness ≤ 3.** If the store is starving, rollout is too slow (sandbox, search,
-   OpenRouter) or too many hints are dropping.
+   OpenRouter) or too many hints are dropping. A freeze after ~K steps with GPUs at 0%
+   is the producer/consumer deadlock: the staleness manager must admit `batch_size`
+   groups per step, not `mini_batch_size`. That is wired in `AsyncStalenessManager`.
 4. **Held-out metric beats the zero-shot baseline.** Tau2: `pass1`. Diligence:
    `judge_score` plus `factual-accuracy` / `analytical-reasoning` / `risk-awareness`.
 

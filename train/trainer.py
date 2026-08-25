@@ -57,15 +57,18 @@ class AsyncStalenessManager:
     Bounds how far generation may run ahead of training, makes sure we don't generate
     rollouts that will end up being too old to use
 
-    everything here is in groups (one group = one prompt). `mini_batch_size` is
-    "groups consumed per training step", `max_concurrent_generation_groups` is the
-    generation-worker count, and every `_RolloutStat` counter moves by 1 per group.
+    everything here is in groups (one group = one prompt). `groups_per_step` is
+    "groups consumed per training step" -- that is trainer.batch_size, NOT
+    mini_batch_size (the grad-accum chunk). Using the smaller number under-admits
+    after the first step and deadlocks once K is exhausted.
+    `max_concurrent_generation_groups` is the generation-worker count, and every
+    `_RolloutStat` counter moves by 1 per group.
     `n_samples_per_prompt` is deliberately absent -- it never scales any of this.
     """
 
-    def __init__(self, max_concurrent_generation_groups: int, mini_batch_size: int, max_staleness_steps: int):
+    def __init__(self, max_concurrent_generation_groups: int, groups_per_step: int, max_staleness_steps: int):
         self.max_concurrent_generation_groups = max_concurrent_generation_groups
-        self.mini_batch_size = mini_batch_size
+        self.groups_per_step = groups_per_step
         self.max_staleness_steps = max_staleness_steps
 
         # Control logics.
@@ -78,7 +81,7 @@ class AsyncStalenessManager:
 
     def load_state_from_checkpoint(self, global_step: int) -> None:
         self._current_global_step = global_step
-        self._stat.accepted = (global_step - 1) * self.mini_batch_size
+        self._stat.accepted = (global_step - 1) * self.groups_per_step
         self._stat.submitted = self._stat.accepted
 
     async def validate_state_at_epoch_end(self, global_step: int) -> None:
@@ -90,7 +93,7 @@ class AsyncStalenessManager:
         """
         async with self._cond:
             assert self._stat.running == 0, "We expect no rollouts are running at end of an epoch."
-            consumed = (global_step - 1) * self.mini_batch_size
+            consumed = (global_step - 1) * self.groups_per_step
             assert (
                 self._stat.accepted == consumed
             ), f"Unexpected number of accepted rollouts. Got {self._stat.accepted} != {consumed}."
@@ -110,10 +113,10 @@ class AsyncStalenessManager:
         """
         # Cumulative ceiling: total groups the trainer will ever have consumed by the time
         # it finishes the step it is allowed to run ahead to.
-        #   max_staleness_steps [steps] x mini_batch_size [groups/step] = groups
+        #   max_staleness_steps [steps] x groups_per_step [groups/step] = groups
         # NOTE: no +1 needed -- _current_global_step is "the step being worked on", so it
         # already equals (steps finished + 1).
-        consumer_capacity = (self.max_staleness_steps + self._current_global_step) * self.mini_batch_size
+        consumer_capacity = (self.max_staleness_steps + self._current_global_step) * self.groups_per_step
 
         # Staleness headroom. Both `accepted` and `consumer_capacity` are LIFETIME totals
         # (accepted accumulates across epochs), so this is not a buffer occupancy -- it is
@@ -268,7 +271,7 @@ class AsyncDataLoader:
 
 def build_dataloader(cfg: Config, dataset: Dataset, is_train: bool=True, is_fully_async:bool=False) -> StatefulDataLoader: 
 
-    batch_size = cfg.trainer.training_batch_size if is_train else cfg.trainer.eval_batch_size
+    batch_size = cfg.trainer.batch_size if is_train else cfg.trainer.eval_batch_size
 
     seeded_generator = torch.Generator()
     seeded_generator.manual_seed(cfg.trainer.seed)
@@ -360,7 +363,10 @@ class SDPOTrainer:
             # store until get_batch() accepts them, so this ceiling must be the store
             # size -- hint.concurrency only bounds the hint LLM, not generation slots.
             max_concurrent_generation_groups=config.generator.engine.store_capacity,
-            mini_batch_size=config.trainer.mini_batch_size,
+            # get_batch() drains trainer.batch_size trajectories per step. Passing
+            # mini_batch_size (grad-accum chunk) here under-admits after step 1 and
+            # deadlocks at K: the producer can only refill K * mini extra groups.
+            groups_per_step=config.trainer.batch_size,
             max_staleness_steps=config.trainer.algorithm.max_staleness,
         )
         self.optimizer = optimizer or torch.optim.AdamW(
@@ -603,6 +609,10 @@ class SDPOTrainer:
             raise RuntimeError(
                 "no weight transport; construct SDPOTrainer with transport=... to sync weights"
             )
+        # asyncio.to_thread does not inherit this process's CUDA device; NCCL then
+        # binds the sender to cuda:0, which is a vLLM worker ("Duplicate GPU").
+        if isinstance(self.device, torch.device) and self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         self.transport.setup(master_address, master_port, world_size)
         self._weight_sync_ready = True
 
@@ -639,6 +649,8 @@ class SDPOTrainer:
         """
         if not self._weight_sync_ready:
             raise RuntimeError("weight sync not initialized; call setup_weight_sync first")
+        if isinstance(self.device, torch.device) and self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         self.transport.send_bucket(bucket)
 
     def bump_policy_version(self) -> int:

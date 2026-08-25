@@ -15,7 +15,7 @@ from train.config import Config
 from data.dataset import Task
 from train.utils import build_batch
 from train.store import Trajectory, TrajectoryStore
-from train.trainer import SDPOTrainer, TrainerState, _slice_batch
+from train.trainer import AsyncStalenessManager, SDPOTrainer, TrainerState, _slice_batch
 
 
 class FakeTokenizer:
@@ -62,6 +62,56 @@ def _trainer(config: Config | None = None) -> SDPOTrainer:
         tasks_by_id={"1": _task("1"), "2": _task("2")},
         device="cpu",
     )
+
+
+def test_staleness_manager_uses_batch_size_as_groups_per_step():
+    """Using mini_batch_size here deadlocks at K: get_batch consumes batch_size."""
+    trainer = _trainer(make_config(batch_size=16, mini_batch_size=4, n_trainer_gpus=4))
+    assert trainer.staleness_manager.groups_per_step == 16
+
+
+def test_k3_loop_does_not_deadlock_when_mini_lt_batch():
+    """Regression for the step-3 hang: producer admits using groups_per_step, consumer
+    drains batch_size, prune at K, notify. Must complete well past K without blocking.
+    """
+    batch_size, k, n_steps = 4, 3, 8
+
+    async def run():
+        mgr = AsyncStalenessManager(
+            max_concurrent_generation_groups=64,
+            groups_per_step=batch_size,
+            max_staleness_steps=k,
+        )
+        store = TrajectoryStore(max_staleness=k)
+        stop = asyncio.Event()
+        current = {"v": 0}
+
+        async def producer():
+            i = 0
+            while not stop.is_set():
+                await mgr.acquire_submission_slot()
+                await store.add(_traj(task_id=str(i), version=current["v"]))
+                i += 1
+
+        prod = asyncio.create_task(producer())
+        try:
+            for step in range(n_steps):
+                batch = await asyncio.wait_for(
+                    store.get_batch(batch_size, staleness_manager=mgr),
+                    timeout=2.0,
+                )
+                assert len(batch) == batch_size
+                current["v"] = step + 1
+                await store.set_policy_version(step + 1)
+                await store.prune_stale(staleness_manager=mgr)
+                await mgr.notify_capacity_change(step + 2)
+        finally:
+            stop.set()
+            await mgr.notify_capacity_change(10_000)
+            prod.cancel()
+            await asyncio.gather(prod, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 def test_train_step_runs_and_returns_metrics():

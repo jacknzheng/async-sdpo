@@ -56,6 +56,17 @@ from torch.distributed.fsdp import (
 # environment when it constructs its generator.
 load_dotenv()
 
+# tau2's UserSimulator talks litellm. If OPENAI_API_KEY is unset it collapses the
+# openrouter/ model slug onto the openai provider and tool-calling breaks. Point
+# both at OpenRouter when only the OR key is present.
+if os.environ.get("OPENROUTER_API_KEY"):
+    os.environ.setdefault("OPENAI_API_KEY", os.environ["OPENROUTER_API_KEY"])
+    os.environ.setdefault("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+
+# NCCL on some workstation images (Baseten) livelocks P2P/CUMEM during weight sync.
+os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+
 # tau2 reads TAU2_DATA_DIR at import. The pip package does not ship `data/`, so we
 # keep a sparse clone of the pinned tau2-bench commit next to the repo.
 _tau2_data = Path(__file__).resolve().parent / ".deps" / "tau2-bench" / "data"

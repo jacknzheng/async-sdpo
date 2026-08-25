@@ -366,7 +366,6 @@ def evaluate_episode(task: Task, tau_messages: list, termination: str, retrieval
         simulation=sim,
         task=task.tau2_task,
         evaluation_type=EvaluationType.ALL,
-        solo_mode=False,
         domain=task.domain,
         env_kwargs=env_kwargs_for(task, retrieval),
     )
@@ -588,8 +587,14 @@ async def run_tau2_episode(
     )
     episode.tau_messages = _to_tau_messages(episode.messages)
     try:
-        episode.reward = evaluate_episode(
-            task, episode.tau_messages, episode.termination, retrieval
+        # evaluate_simulation is sync and can reconstruct an env (banking
+        # sandbox). Running it on the event loop freezes get_batch / timeouts.
+        episode.reward = await asyncio.to_thread(
+            evaluate_episode,
+            task,
+            episode.tau_messages,
+            episode.termination,
+            retrieval,
         )
     except Exception:
         logger.exception("tau2 evaluate_simulation failed for %s", task.task_id)
