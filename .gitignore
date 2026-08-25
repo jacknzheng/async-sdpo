@@ -1,5 +1,7 @@
 # Secrets -- .env holds OPENROUTER_API_KEY for the judge. Never commit it.
 .env
+# Staging copy of the jerry-agent request (will contain keys meant for that public branch).
+jerry-agent-request.md
 
 # Python
 __pycache__/
