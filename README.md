@@ -1,8 +1,16 @@
-# Off-policy SDPO on DiligenceBench
+# Off-policy SDPO (tau2 + DiligenceBench)
 
 A reproduction of the training setup from Trajectory's field report
-[Scaling SDPO](https://trajectory.ai/field-notes/scaling-sdpo), applied to
-[`paperinstruments/diligence-bench`](https://huggingface.co/datasets/paperinstruments/diligence-bench).
+[Scaling SDPO](https://trajectory.ai/field-notes/scaling-sdpo), applied to two
+tool-using evals:
+
+- **tau2** (default) — Sierra `banking_knowledge` + `retail` + `airline`. Multi-turn
+  TIR with a user simulator; held-out metric is pass^1.
+- **DiligenceBench** — [`paperinstruments/diligence-bench`](https://huggingface.co/datasets/paperinstruments/diligence-bench).
+  Multi-turn TIR with Parallel `web_search`, scored by a rubric judge (eval only).
+
+Launch with the scripts in `scripts/`. Do not start from a raw `python run.py` on an
+8×H100 unless you are iterating on a one-off override.
 
 ## What SDPO is, in plain terms
 
@@ -23,6 +31,12 @@ second model, no reward model, and no human labels — one model, prompted two w
 **The student never sees the hint.** It only ever answers the bare question; the hint exists
 purely to make the teacher a better predictor for one forward pass.
 
+**There is no reward in the gradient.** Tau2 pass^1 and the diligence rubric judge are
+eval diagnostics. The training signal is the teacher−student logp gap
+(`teacher_minus_student_logp`). If that gap is ~0, training is a no-op even when the loss
+curve looks healthy. This is the thing people mean by "reward variance collapsed" in this
+repo.
+
 ## What "off-policy" means here
 
 Generating an answer is slow; a training step is fast. If the trainer waits for every
@@ -32,7 +46,7 @@ model has already changed a few times.
 
 Naive off-policy correction (importance sampling) empirically collapses after 50 steps as
 on rare tokens the correction ratio explodes to 50-100x and one token hijacks the update.
-The fix is two clips: PPO-style ratio clipping, and advantage clipping at 3x a running average. 
+The fix is two clips: PPO-style ratio clipping, and advantage clipping at 3x a running average.
 We run at **K = 3**: flat accuracy from K=0 to K=3, degrading after, and ~2x wall-clock speedup
 over synchronous training.
 
@@ -62,29 +76,149 @@ The paper proves the baseline term vanishes identically; whitening would destroy
 because unlike GRPO's relative advantages the _absolute sign_ here means "teacher agrees /
 disagrees" and is the entire point.
 
+## Run it (8×H100)
+
+Default stack: `Qwen/Qwen3.8-27B`, 4 vLLM rollout GPUs + 4 FSDP2 trainer ranks, max
+staleness K=3, `vllm==0.26.x` and `torch==2.11.0+cu128` pinned exactly. Python 3.12.
+Do not let uv pull torch 2.13 (CUDA 13) — it will not load on a 12.8 driver.
+
+### Secrets
+
+Put a gitignored `.env` at the repo root (`run.py` loads it before anything that reads
+keys). Never commit it.
+
+```bash
+OPENROUTER_API_KEY=...   # hints, diligence judge, tau2 user simulator
+WANDB_API_KEY=...
+HF_TOKEN=...             # model download
+PARALLEL_API_KEY=...     # diligence web_search only
+```
+
+### Install
+
+```bash
+uv sync --extra knowledge          # tau2 + banking retrieval; also enough for diligence
+bash scripts/setup_tau2_sandbox.sh # banking_knowledge shell tool; skip only if you will
+                                   # never touch banking
+which srt rg bwrap socat           # all four must exist on Linux
+uv run pytest tests/ -q            # offline; no GPU
+```
+
+`setup_tau2_sandbox.sh` installs `@anthropic-ai/sandbox-runtime@0.0.23` plus
+`ripgrep`, `bubblewrap`, `socat`. Retail and airline do not need this.
+`banking_knowledge`'s `shell` tool raises `SandboxRuntimeError` at env construction if
+any of them is missing, and can also die mid-episode (no nested userns, bwrap perms, srt
+crash). Treat banking as the canary: `gold_banking` before the three-domain `gold` run.
+
+### Launch
+
+```bash
+# Prove the loop on one box before scaling out. Tiny model, 10 steps, not a result.
+bash scripts/run_taubench.sh smoke
+bash scripts/run_diligencebench.sh smoke
+
+# Zero-shot held-out numbers to beat.
+bash scripts/run_taubench.sh baseline
+bash scripts/run_diligencebench.sh baseline
+
+# Training ablations (one 8×H100 per arm is the intended fleet).
+bash scripts/run_taubench.sh gold
+bash scripts/run_taubench.sh step_hint
+bash scripts/run_taubench.sh gold_banking
+
+bash scripts/run_diligencebench.sh answer_free
+bash scripts/run_diligencebench.sh answer_bearing
+bash scripts/run_diligencebench.sh mixture
+```
+
+Dotted overrides after the mode, e.g. `bash scripts/run_taubench.sh gold trainer.total_steps=200`.
+Logs land in `/log/<run_name>/` (`train.log`, `console.log`, `args.txt`, `config.yaml`);
+if `/log` is not writable the scripts fall back to `./log`. Checkpoints go to
+`runs/sdpo-tau2/` or `runs/sdpo-diligence/`. Wandb projects: `sdpo-tau2` / `sdpo-diligence`.
+
+The real run is `torchrun --nproc-per-node=4` (one process per trainer GPU). Rank 0 owns
+rollout, the store, eval, and wandb; ranks 1–3 only train. `--smoke` and `--baseline` are
+single-process.
+
+### Host disk (not just RunPod)
+
+When `/workspace` exists (RunPod volume), `run.py` points compile/HF caches there. On any
+other host (Baseten, a raw workstation) that directory often does not exist — export the
+same vars at a persistent disk yourself, or every boot re-compiles:
+
+| env var                   | RunPod default                     | what it saves                 |
+| ------------------------- | ---------------------------------- | ----------------------------- |
+| `VLLM_CACHE_ROOT`         | `/workspace/.cache/vllm`           | vLLM torch.compile artifacts  |
+| `TORCHINDUCTOR_CACHE_DIR` | `/workspace/.cache/torchinductor`  | trainer compiled kernels      |
+| `TRITON_CACHE_DIR`        | `/workspace/.cache/triton`         | trainer Triton kernels        |
+| `HF_HOME`                 | `/workspace/hf`                    | model weights                 |
+
+All are `setdefault`. Also: large `/dev/shm` for vLLM TP workers; pin `vllm==0.26.0`;
+put the venv on persistent disk so the image is not rebuilt every boot.
+
+If training misbehaves, `trainer.compile_trainer=false` is the first debug lever.
+`--smoke` already runs uncompiled.
+
+## Ablations
+
+### Tau2 (`scripts/run_taubench.sh`)
+
+| Mode           | Teacher hint                                      | Notes                                      |
+| -------------- | ------------------------------------------------- | ------------------------------------------ |
+| `gold`         | Sierra gold docs / canonical tool trajectory      | Main arm. No hint LLM. Cheap.              |
+| `step_hint`    | OpenRouter names the single next correct action   | Gold + transcript in, one action out.      |
+| `gold_banking` | Same as `gold`, `banking_knowledge` only          | Sandbox-stress arm.                        |
+| `baseline`     | n/a                                               | Zero-shot pass^1 on ~87 held-out tasks.    |
+| `smoke`        | gold, tiny model                                  | Sanity check.                              |
+
+Eval metric: `pass1` overall and per domain. Binary, so eval "reward variance" is low by
+construction. A fleet of zeros on banking is almost always the sandbox, not the loss.
+
+### Diligence (`scripts/run_diligencebench.sh`)
+
+Needs `data.dataset=diligence` and `data.n_heldout=30` (the script sets both). Parallel
+`web_search` (`data.search_mode=fast`). Tool-result tokens are masked out of the SDPO
+loss; agent tokens between searches are SOD-reweighted.
+
+| Mode             | Teacher hint                                      | Notes                                      |
+| ---------------- | ------------------------------------------------- | ------------------------------------------ |
+| `answer_free`    | Must not state figures / conclusions              | Main arm. Prompt-enforced, no regex.       |
+| `answer_bearing` | May cite missed rubric facts verbatim             | Stronger teacher; closer to distillation.  |
+| `mixture`        | 50/50 KL mix of the two                           | Both hints must succeed or the rollout drops. |
+| `baseline`       | n/a                                               | Zero-shot rubric-judge score, 30 held-out. |
+| `smoke`          | answer_free, tiny model                           | Sanity check.                              |
+
+Both diligence arms see the full rubric; only the output is constrained. A win on
+`answer_bearing` measures something different from `answer_free` and should be reported
+as such.
+
 ## Configuration
 
-| Setting            | Value                             | Source                      |
+Defaults live in `train/config.py`. Trailing dotted CLI args override them
+(`trainer.optimizer.learning_rate=1e-5`). Every field must already exist on the
+dataclasses — `+new.field=...` is rejected.
+
+| Setting            | Value                             | Notes                       |
 | ------------------ | --------------------------------- | --------------------------- |
-| model              | `Qwen/Qwen3-8B`                   | spec                        |
-| GPUs               | 4 rollout / 4 trainer (DDP)       | see below                   |
-| batch / mini-batch | 32 / 16                           | spec                        |
+| model              | `Qwen/Qwen3.8-27B`                | smoke: `Qwen/Qwen3-0.6B`    |
+| GPUs               | 4 rollout / 4 trainer (FSDP2)     | see below                   |
+| batch / mini-batch | 16 / 4                            | must divide trainer world   |
 | max staleness K    | 3                                 | blog + confirmed            |
-| clip window        | `clip(r, 0.8, 1.4)`               | see below                   |
+| clip window        | `clip(r, 0.8, 1.4)`               | must contain 1.0            |
 | advantage clip     | 3.0x EMA (decay 0.99)             | blog (3x); EMA spec is ours |
 | group size         | 1, failures retained              | blog's headline finding     |
 | KL penalty         | off                               | blog dropped it             |
+| SOD                | on (`eps=1e-6`, `delta=0.2`)      | no-op on single-step trajs  |
+| total steps        | 500                               | eval every 25               |
 
 **GPU split.** Rollout GPUs come first (vLLM's multiprocess workers pick `cuda:0..TP-1`
-by worker index); each trainer rank pins `cuda:{n_rollout_gpus + rank}`. The trainer is
-**DDP, not FSDP**: Qwen3-8B in pure bf16 (~16 GB weights + ~16 GB gradients + ~33 GB Adam
-state ≈ 65 GB) fits on a single 80 GB H100 — tightly, which is why `run.py` sets
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` — so sharding buys nothing; each rank
-holds a full copy and only gradients are all-reduced. The hinted teacher gets **no dedicated GPU**: it is the *same weights* as the
-student, and every DDP rank already holds a full copy, so each rank runs its own teacher
-forward locally under `no_grad`. That frees the 8th GPU for rollout (TP=4, a power of two,
-divides attention heads evenly), which is the slow side and the reason this run is async
-in the first place.
+by worker index); each trainer rank pins `cuda:{n_rollout_gpus + rank}`. 27B in bf16 does
+not fit on one 80 GB H100, so the trainer is **FSDP2**, not DDP: each transformer block is
+its own shard unit, then the root. 8B *would* fit as a full copy (~16 GB weights + 16 GB
+grads + 33 GB Adam ≈ 65 GB, hence `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) —
+if 27B OOMs after shrinking `mini_batch_size`, `model.model=Qwen/Qwen3-8B` is the fallback.
+The hinted teacher gets **no dedicated GPU**: it is the same weights as the student, run
+under `no_grad` on each trainer rank. That keeps TP=4 on the rollout side (a power of two).
 
 **Clip window.** The IS ratio `r = π_current/π_rollout` is centered at **1.0**, so the
 window must contain 1.0 — a `[1.2, 1.4]` window would clip every _unchanged_ token. `1.4`
@@ -107,56 +241,54 @@ for the first ~100 steps — exactly when training is least stable.
 
 ## Hints are error-conditioned
 
-Every hint is written **per rollout** by an LLM (`stealth/ox-alpha` on OpenRouter)
-that reads the draft the student actually produced, compares it against the rubric, and names
-where *that* draft fell short. Two rollouts of the same task get different hints: one that
-missed the funding-risk angle is told about funding risk; one that missed the margin math is
-told something else.
+On diligence (and tau2 `step_hint`), every hint is written **per rollout** by an LLM
+(`stealth/ox-alpha` on OpenRouter) that reads the draft the student actually produced.
+Two rollouts of the same task get different hints. Tau2 `gold` skips the LLM and injects
+Sierra gold / the canonical tool trajectory instead.
 
-There is no static rubric-derived hint. An earlier version built hints from the rubric alone,
-which meant every rollout of a task got a byte-identical hint no matter what the model wrote.
+A rollout whose hint cannot be generated is **dropped**, not trained with an empty hint:
+an unhinted teacher is identical to the student and would contribute ~zero gradient. Watch
+`store_hint_dropped_percent` (and `store.stats.hint_dropped`). A sustained nonzero value
+means the hint model, not the rollout engine, is the bottleneck on data production.
 
-**The ablation** — may the hint state the answer? Both arms see the full rubric; only the
-output differs:
+## What to watch (and what to fix)
 
-```bash
-python run.py                              # answer_free (default)
-python run.py --hint-prompt answer_bearing # may cite the missed figures verbatim
-```
+During a real run, in order:
 
-`answer_free` is enforced by the prompt alone — there is no regex backstop, so a model that
-ignores the instruction can leak a figure into the teacher's context. `answer_bearing` makes
-the teacher a model reading the answer key, which is closer to supervised distillation than
-self-distillation; a win there measures something different and should be reported as such.
+1. **Teacher−student gap is clearly nonzero.** `trainer.py` logs
+   `teacher_minus_student_logp` every step and warns when `|gap| < 1e-3`. That is a dead
+   gradient. Typical causes: hint too timid (`answer_free`), hint LLM failing / empty,
+   gold suffix not actually landing, sandbox producing empty transcripts, SOD + loss mask
+   eating every token. Stronger teacher = `answer_bearing` / `gold`; do **not** add
+   GRPO-style whitening or a baseline term.
+2. **Clip fractions are a modest minority of tokens.** All-clipped means the off-policy
+   correction is a no-op; all-unclipped with exploding ratios is the failure the clips
+   exist to prevent.
+3. **Staleness ≤ 3.** If the store is starving, rollout is too slow (sandbox, search,
+   OpenRouter) or too many hints are dropping.
+4. **Held-out metric beats the zero-shot baseline.** Tau2: `pass1`. Diligence:
+   `judge_score` plus `factual-accuracy` / `analytical-reasoning` / `risk-awareness`.
 
-**The main risk to watch.** SDPO's entire gradient is the teacher-student gap. If the hint is
-too subtle for the teacher to outpredict the student, that gap goes to ~0, the loss goes to
-~0, and training will not move — no matter how healthy the loss curve looks. `trainer.py` logs
-`teacher_minus_student_logp` every step and warns loudly when it approaches zero.
+**Sandbox.** If banking episodes are all reward 0 or env construction throws
+`SandboxRuntimeError`, install the four host binaries, fail loud at startup if they are
+missing, and do not let one broken `shell` call kill the training process. Isolate
+banking (`gold_banking`) rather than taking down the three-domain `gold` run.
 
-A rollout whose hint cannot be generated is **dropped**, not trained with an empty hint: an
-unhinted teacher is identical to the student and would contribute ~zero gradient. Watch
-`RolloutEngine.hintless_dropped` — a sustained nonzero value means the hint model, not the
-rollout engine, is the bottleneck on data production.
+**Do not** flip the SDPO sign, change the clip window to exclude 1.0, filter
+zero-variance groups (`group_size=1`, `keep_failures=True` is the blog finding), or
+"simplify" weight-sync order (receive RPC must be in flight before `trainer_send_weights`).
 
 ## Verification
 
 Everything through the trainer is CPU-testable — no GPU, no model downloads:
 
 ```bash
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python torch transformers datasets rubric requests \
-  python-dotenv pytest
-.venv/bin/python -m pytest tests/ -q          # 123 tests
+uv sync
+uv run pytest tests/ -q
 ```
 
-The test suite is fully offline. Only the judge reaches the network, and only at eval time
-— it runs on OpenRouter, so `python run.py` and `--baseline` need a key in `.env` at the
-repo root (gitignored; `run.py` loads it automatically):
-
-```bash
-echo 'OPENROUTER_API_KEY=sk-or-v1-...' > .env
-```
+The test suite is fully offline. Only the judge / hint LLM / tau2 user sim / Parallel
+search reach the network, and only on a real run.
 
 What the tests actually pin down:
 
@@ -169,34 +301,33 @@ What the tests actually pin down:
 - **Staleness boundary** — K=3 is trained on, K=4 is evicted.
 - **Loss decreases** — repeated steps on a fixed batch reduce the loss on a real model.
 - **Gradient accumulation** — mini-batched gradients equal full-batch gradients.
-- **No answer leakage** — asserts no generated hint contains a digit, across all 150 rows.
 - **Weight-sync deadlock ordering** — asserts the receive-side RPC is dispatched _before_
   the trainer broadcasts. Also mutation-verified: restoring the naive
   await-then-broadcast order makes the test hang and fail.
 
 ## Backends
 
-The inference engine sits behind two protocols in `train/engine.py`, so a new backend is a
-new file plus a config value rather than an edit to the trainer:
+The inference engine sits behind two protocols in `train/backends/backend.py`, so a new
+backend is a new file plus a config value rather than an edit to the trainer:
 
 | protocol | side | who holds it | vLLM implementation |
 | --- | --- | --- | --- |
 | `InferenceEngine` | receive | orchestrator (`run.py`) | `VLLMRolloutEngine` |
 | `WeightTransport` | send | trainer (`train/trainer.py`) | `NCCLWeightTransport` |
 
-They are **always chosen together** — `train/backends/get_backend(name)` returns the pair,
-selected by `config.rollout_backend` (default `"vllm"`). The receiver derives its
+They are **always chosen together** — `train.backends.get_backend(name)` returns the pair,
+selected by `generator.engine.backend` (default `"vllm"`). The receiver derives its
 broadcasts from metadata the sender chose, so a mismatched pair would hang the rendezvous
 rather than fail loudly; pairing them at the selector makes that unrepresentable.
 
-Two protocols rather than one because fusing them would put engine concerns back inside
-the trainer — which is the coupling this exists to remove. `train/backends/vllm.py` is the
-only module in the package that imports vLLM, and every import there is lazy, so the
-package stays importable (and the full test suite runs) on a laptop without vLLM.
+`train/backends/vllm.py` is the only module in the package that imports vLLM, and every
+import there is lazy, so the package stays importable (and the full test suite runs) on a
+laptop without vLLM.
 
 Adding a backend means implementing both protocols. **Read the invariants at the top of
-`train/engine.py` first** — particularly processed-logprobs, which a new engine can violate
-silently: SGLang's logprob semantics differ from vLLM's and must be verified, not assumed.
+`train/backends/backend.py` first** — particularly processed-logprobs, which a new engine
+can violate silently: SGLang's logprob semantics differ from vLLM's and must be verified,
+not assumed.
 
 ## Weight sync
 
@@ -243,58 +374,15 @@ Written against **vLLM 0.26.x — pin it exactly.** The native weight-transfer A
   the sampling transform. Silent and systematic, not a crash.
 - `SamplingParams.flat_logprobs` must stay `False`, or `.logprobs` stops being a plain list.
 
-On the 8-GPU box:
-
-```bash
-python run.py --baseline               # zero-shot held-out judge score (the number to beat)
-python run.py --smoke                  # 10 steps on Qwen3-0.6B, 2 GPUs, single process
-torchrun --nproc-per-node=4 run.py     # the real run: 4 vLLM GPUs + 4 DDP trainer ranks
-```
-
-The real run must be launched with `torchrun` (one process per trainer GPU); rank 0 owns
-all the async machinery and broadcasts each batch, ranks 1–3 just train their shard.
-Checkpoints (model + optimizer + EMA-clipper state) land in `runs/sdpo-diligence/step_N/`
-every `checkpoint_interval` steps, plus `step_final/` at the end — RunPod pods get
-interrupted, and a run that saves nothing never happened.
-
-During a real run, watch in order: (1) `teacher-student gap` is clearly non-zero,
-(2) clip fractions are a modest minority of tokens, (3) `staleness` sits at or below 3,
-(4) held-out judge score rises above the zero-shot baseline.
-
-**Cold start & compile caches.** When `/workspace` (RunPod's volume disk, which survives
-pod stop/start) exists, `run.py` automatically points every slow-to-rebuild cache at it:
-
-| env var                  | default                          | what it saves on re-boot        |
-| ------------------------ | -------------------------------- | ------------------------------- |
-| `VLLM_CACHE_ROOT`        | `/workspace/.cache/vllm`         | vLLM's torch.compile artifacts  |
-| `TORCHINDUCTOR_CACHE_DIR`| `/workspace/.cache/torchinductor`| trainer's compiled kernels      |
-| `TRITON_CACHE_DIR`       | `/workspace/.cache/triton`       | trainer's Triton kernels        |
-| `HF_HOME`                | `/workspace/hf`                  | ~16 GB model download           |
-
-All are `setdefault`, so anything you export yourself wins. The FIRST run on a fresh pod
-pays everything once — model download, vLLM engine compile, and the trainer's
-`torch.compile` on its first step (the trainer compiles with `dynamic=True` because padded
-batch shapes differ every step). Every boot after that reuses the caches and starts in
-seconds, not tens of minutes. If training misbehaves, `compile_trainer=False` in
-`config.py` is the first debug lever — compile + DDP + gradient checkpointing + varying
-shapes is the most fragile stack in here (`--smoke` already runs uncompiled for this
-reason).
-
-**RunPod checklist.** Put the `.env` with `OPENROUTER_API_KEY` at the repo root, pin
-`vllm==0.26.0` in the image, and give the container a large `/dev/shm` — vLLM's
-multiprocess tensor-parallel workers communicate through it. Also put the *venv itself*
-on `/workspace` (e.g. `uv venv /workspace/venv && uv pip install --python
-/workspace/venv/bin/python -r requirements.txt`): packages download and build once on the
-first boot and every later boot is a seconds-fast no-op.
-
 ## Deviations from the blog, and why
 
 | Blog                              | Here                                     | Why                            |
-| --------------------------------- | ---------------------------------------- | ------------------------------ |
-| Tau-Retail (multi-turn, tool-use) | diligence-bench (single-turn, long-form) | requested                      |
-| symmetric PPO clip ε=0.2          | DAPO decoupled 0.8 / 1.4                 | requested                      |
-| hint = canonical answer           | hint = answer-free reasoning nudge       | requested                      |
-| no reward model at all            | rubric judge for **eval only**           | judge is never in the gradient |
+| ---------------------------------- | ---------------------------------------- | ------------------------------ |
+| Tau-Retail only                    | tau2 (banking+retail+airline) + diligence | both requested                 |
+| Qwen3-8B DDP                       | Qwen3.8-27B FSDP2                        | 27B does not fit per-rank      |
+| symmetric PPO clip ε=0.2           | DAPO decoupled 0.8 / 1.4                 | requested                      |
+| hint = canonical answer            | gold / step_hint / answer_free|bearing   | per-dataset ablations          |
+| no reward model at all             | rubric judge + tau2 pass^1, **eval only** | neither is in the gradient    |
 
 ## References
 
@@ -302,3 +390,4 @@ first boot and every later boot is a seconds-fast no-op.
 - [Reinforcement Learning via Self-Distillation](https://arxiv.org/abs/2601.20802) —
   Hübotter et al., arXiv:2601.20802
 - [`lasgroup/SDPO`](https://github.com/lasgroup/SDPO) — official implementation
+- [tau2-bench](https://github.com/sierra-research/tau2-bench) — Sierra
