@@ -282,6 +282,34 @@ def test_bad_request_is_terminal(monkeypatch):
     assert len(sent) == 1
 
 
+def test_json_schema_404_falls_back_to_json_object(monkeypatch):
+    """OpenRouter 404s strict json_schema on the default judge models; json_object routes."""
+    schema_404 = FakeResponse(
+        status_code=404,
+        text="No endpoints found that can handle the requested parameters",
+    )
+    gen, sent = _generator(monkeypatch, [schema_404, _ok()], max_retries=3)
+    output = asyncio.run(gen("sys", "user"))
+    assert output.criteria_evaluations[0].criterion_status == "MET"
+    assert len(sent) == 2
+    first = json.loads(sent[0]["data"])
+    second = json.loads(sent[1]["data"])
+    assert first["response_format"]["type"] == "json_schema"
+    assert first["provider"]["require_parameters"] is True
+    assert second["response_format"] == {"type": "json_object"}
+    assert "provider" not in second
+
+
+def test_json_schema_400_does_not_fall_back(monkeypatch):
+    """A malformed schema is a programming error, not an OpenRouter routing gap."""
+    gen, sent = _generator(
+        monkeypatch, [FakeResponse(status_code=400, text="invalid json_schema")] * 3
+    )
+    with pytest.raises(TerminalJudgeError, match="rejected"):
+        asyncio.run(gen("sys", "user"))
+    assert len(sent) == 1
+
+
 def test_rate_limit_is_retried_not_terminal(monkeypatch):
     """429 is a 4xx but genuinely transient."""
     gen, sent = _generator(monkeypatch, [FakeResponse(status_code=429), _ok()], max_retries=3)

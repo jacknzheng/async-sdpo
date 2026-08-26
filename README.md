@@ -156,6 +156,12 @@ The real run is `torchrun --nproc-per-node=4` (one process per trainer GPU). Ran
 rollout, the store, eval, and wandb; ranks 1–3 only train. `--smoke` and `--baseline` are
 single-process.
 
+Rank 0 starts the vLLM engine *before* `init_process_group`, with torchrun/elastic env
+vars stripped for the spawn. Otherwise the TP=4 workers inherit `WORLD_SIZE=4` and hang
+on torchrun's TCPStore (`127.0.0.1:<port>` timeout) instead of forming their own — that
+is the Baseten 4+4 failure. Do not move `engine.start()` to after the trainer group
+joins.
+
 ### Host disk (not just RunPod)
 
 When `/workspace` exists (RunPod volume), `run.py` points compile/HF caches there. On any

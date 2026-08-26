@@ -196,6 +196,68 @@ def test_module_imports_without_vllm_installed():
         assert hasattr(rollout.VLLMRolloutEngine, method), method
 
 
+def test_isolated_from_torchrun_strips_and_restores(monkeypatch):
+    """vLLM TP workers inherit os.environ at spawn. torchrun's WORLD_SIZE matches TP=4
+    on the 8xH100 split, so leaking it makes workers join the trainer TCPStore."""
+    import os
+
+    from train.backends.vllm import isolated_from_torchrun
+
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCHELASTIC_USE_AGENT_STORE", "1")
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "abc")
+    monkeypatch.setenv("UNRELATED", "keep-me")
+
+    with isolated_from_torchrun():
+        assert "RANK" not in os.environ
+        assert "WORLD_SIZE" not in os.environ
+        assert "MASTER_PORT" not in os.environ
+        assert "TORCHELASTIC_USE_AGENT_STORE" not in os.environ
+        assert "TORCHELASTIC_RUN_ID" not in os.environ
+        assert os.environ["UNRELATED"] == "keep-me"
+        assert os.environ.get("VLLM_HOST_IP") == "127.0.0.1"
+
+    assert os.environ["RANK"] == "0"
+    assert os.environ["WORLD_SIZE"] == "4"
+    assert os.environ["TORCHELASTIC_USE_AGENT_STORE"] == "1"
+    assert os.environ["UNRELATED"] == "keep-me"
+    assert "VLLM_HOST_IP" not in os.environ
+
+
+def test_start_refuses_an_already_initialized_process_group(monkeypatch):
+    """The Baseten 4+4 hang: engine.start() after dist.init_process_group."""
+    import torch.distributed as dist
+    from train.config import Config
+    from train.backends.vllm import VLLMRolloutEngine
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    engine = VLLMRolloutEngine(Config())
+    with pytest.raises(RuntimeError, match="cannot be spawned after"):
+        engine.start()
+
+
+def test_weight_sync_port_falls_back_when_preferred_is_taken():
+    """A leftover process holding 51216 dropped the answer_bearing arm."""
+    import socket
+
+    from run import _pick_weight_sync_port
+
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    taken = int(holder.getsockname()[1])
+    try:
+        chosen = _pick_weight_sync_port("127.0.0.1", taken)
+        assert chosen != taken
+        assert chosen > 0
+    finally:
+        holder.close()
+
+
 # ---- error-conditioned hint generation (no GPU, no network) ----
 
 def _task():

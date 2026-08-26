@@ -339,6 +339,48 @@ async def run_loop(
     if pending_trajectories:
         await asyncio.gather(*pending_trajectories, return_exceptions=True)
 
+def _pick_weight_sync_port(host: str, preferred: int) -> int:
+    """Bind `preferred`, or an ephemeral port if a previous run still holds it.
+
+    A stuck EngineCore / weight-sync process on 51216 is what killed the answer_bearing
+    arm (`Address already in use`). Both sides of the rendezvous run in this process, so
+    they share whatever we return. The probe socket is closed before NCCL binds.
+    """
+    import socket
+
+    for port in (preferred, 0):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # No SO_REUSEADDR: a leftover listener on 51216 must fail this probe,
+            # not look free and then explode inside NCCL.
+            sock.bind((host, port))
+            chosen = int(sock.getsockname()[1])
+        except OSError:
+            continue
+        finally:
+            sock.close()
+        if port != preferred:
+            logger.warning(
+                "weight-sync port %d in use; using %d instead", preferred, chosen
+            )
+        return chosen
+    raise RuntimeError(f"could not bind a weight-sync port on {host}")
+
+
+def _init_trainer_process_group(config: Config) -> None:
+    """Join the FSDP group. Rank 0 must call this AFTER the rollout engine has spawned.
+
+    torchrun already sized WORLD_SIZE to the trainer ranks. The rollout GPUs never join.
+    """
+    rank, world = _dist_info()
+    if world <= 1 or (dist.is_available() and dist.is_initialized()):
+        return
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(config.generator.engine.n_rollout_gpus + local_rank)
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
+    logger.info("trainer process group ready: rank %d / %d", rank, world)
+
+
 async def train(config: Config, smoke: bool = False, ctx: RunContext | None = None) -> None:
     """Every trainer rank runs this. Rank 0 also owns rollout + eval."""
     rank, world = _dist_info()
@@ -353,11 +395,11 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
         logger.info("loaded %d train / %d held-out tasks", len(train_tasks), len(heldout_tasks))
 
     engine_cls, transport_cls = get_backend(config.generator.engine.backend)
-    # Only rank 0 pushes weights into vLLM.
-    trainer = build_trainer(
-        config, smoke, train_tasks + heldout_tasks, transport=transport_cls() if rank == 0 else None
-    )
 
+    # Rank 0 starts vLLM BEFORE the trainer process group exists. The engine's TP
+    # workers are spawned from this process; if they inherit torchrun's rendezvous
+    # (or a live default process group) they hang on TCPStore instead of forming
+    # their own. Other ranks skip this and wait at init_process_group.
     engine = None
     store = None
     judge = None
@@ -374,7 +416,6 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
             config, model=config.model.smoke_model if smoke else config.model.model
         )
         engine.start()
-        judge = None
         if config.data.dataset == "diligence":
             judge = RubricJudge(
                 config.judge.model,
@@ -382,18 +423,29 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                 config.judge.max_retries,
                 config.judge.timeout,
             )
+
+    _init_trainer_process_group(config)
+
+    # Only rank 0 pushes weights into vLLM.
+    trainer = build_trainer(
+        config, smoke, train_tasks + heldout_tasks, transport=transport_cls() if rank == 0 else None
+    )
+
+    if rank == 0:
         weight_world_size = config.generator.engine.n_rollout_gpus + 1
+        sync_host = config.generator.engine.weight_sync_host
+        sync_port = _pick_weight_sync_port(sync_host, config.generator.engine.weight_sync_port)
         await asyncio.gather(
             engine.init_weight_update_group(
-                master_address=config.generator.engine.weight_sync_host,
-                master_port=config.generator.engine.weight_sync_port,
+                master_address=sync_host,
+                master_port=sync_port,
                 rank_offset=1,
                 world_size=weight_world_size,
             ),
             asyncio.to_thread(
                 trainer.setup_weight_sync,
-                config.generator.engine.weight_sync_host,
-                config.generator.engine.weight_sync_port,
+                sync_host,
+                sync_port,
                 weight_world_size,
             ),
         )
@@ -576,9 +628,9 @@ def main() -> None:
             raise SystemExit(
                 f"batch_size {config.trainer.batch_size} not divisible by world size {world}"
             )
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(config.generator.engine.n_rollout_gpus + local_rank)
-        dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
+        # Do NOT init_process_group here. Rank 0 has to spawn the vLLM engine first
+        # (see train()), or TP workers inherit this rendezvous and hang on TCPStore.
+        # Ranks 1..N wait inside train() at _init_trainer_process_group.
     elif config.trainer.n_trainer_gpus > 1 and not args.baseline:
         logger.warning(
             "launched as a single process with n_trainer_gpus=%d -- only one trainer GPU "

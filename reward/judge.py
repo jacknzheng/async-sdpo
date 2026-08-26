@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -49,6 +50,8 @@ from rubric import EvaluationReport, OneShotOutput
 from rubric.autograders import PerCriterionOneShotGrader
 
 from data.dataset import Task
+
+logger = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -115,6 +118,12 @@ async def chat_completion(
     `response_format` and the provider filter, since requiring structured-output support
     would needlessly narrow routing for a plain-prose request.
 
+    When a schema IS requested, we first ask for strict `json_schema` +
+    `provider.require_parameters`. OpenRouter 404s that combination on several models
+    ("No endpoints found that can handle the requested parameters") -- including the
+    default judge -- so a 404 / unroutable schema falls back to `json_object` without
+    the provider filter. Hints never take this path.
+
     `parse` runs INSIDE the retry loop. That placement matters: a schema violation is
     transient -- the model emitted prose or a truncated object, and a resample usually
     fixes it -- so it must be retried like any other transient failure rather than raised
@@ -122,6 +131,51 @@ async def chat_completion(
 
     Raises TerminalJudgeError for failures a retry cannot fix; retries everything else.
     """
+    modes: list[str | None]
+    if response_schema is not None:
+        modes = ["json_schema", "json_object"]
+    else:
+        modes = [None]
+
+    last_error: Exception | None = None
+    for i, mode in enumerate(modes):
+        payload = _chat_payload(
+            system_prompt,
+            user_prompt,
+            model=model,
+            max_tokens=max_tokens,
+            response_schema=response_schema,
+            mode=mode,
+        )
+        try:
+            return await _post_chat_completion(
+                payload,
+                api_key=api_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                parse=parse,
+            )
+        except TerminalJudgeError as exc:
+            if i + 1 < len(modes) and _structured_output_unroutable(exc):
+                logger.warning(
+                    "strict json_schema unroutable on OpenRouter; falling back to json_object: %s",
+                    exc,
+                )
+                last_error = exc
+                continue
+            raise
+    raise RuntimeError(f"openrouter call failed: {last_error}")
+
+
+def _chat_payload(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    model: str,
+    max_tokens: int,
+    response_schema: dict | None,
+    mode: str | None,
+) -> dict:
     payload: dict = {
         "model": model,
         # Anthropic took the system prompt as a top-level kwarg; on the OpenAI wire format
@@ -137,7 +191,7 @@ async def chat_completion(
         "temperature": 0.0,
         "reasoning": {"enabled": True},
     }
-    if response_schema is not None:
+    if mode == "json_schema":
         payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {"name": "one_shot_output", "strict": True, "schema": response_schema},
@@ -146,7 +200,26 @@ async def chat_completion(
         # Without this a provider may ignore response_format and return prose, which lands
         # as a parse failure or, worse, a wrongly-zero eval score.
         payload["provider"] = {"require_parameters": True}
+    elif mode == "json_object":
+        # Widely routed; the caller still validates against OneShotOutput.
+        payload["response_format"] = {"type": "json_object"}
+    return payload
 
+
+def _structured_output_unroutable(exc: BaseException) -> bool:
+    """OpenRouter 404s strict json_schema on models that otherwise chat fine."""
+    text = str(exc).lower()
+    return "no endpoints found" in text or "(404)" in text
+
+
+async def _post_chat_completion(
+    payload: dict,
+    *,
+    api_key: str,
+    timeout: float,
+    max_retries: int,
+    parse: Callable[[str], object] | None,
+):
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     def post() -> requests.Response:

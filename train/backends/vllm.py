@@ -49,7 +49,9 @@ import asyncio
 import logging
 import os
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from typing import Iterator
 
 from train.config import Config
 from data.dataset import Task, build_prompt
@@ -60,6 +62,66 @@ logger = logging.getLogger(__name__)
 
 # vLLM uses CUDA in subprocesses, which requires spawn rather than fork.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+# torchrun / torchelastic leak these into every child. vLLM's TP workers inherit them
+# and then try to join the *trainer* rendezvous (WORLD_SIZE matches TP size on a 4+4
+# box) instead of opening their own TCPStore -- that is the Baseten 4+4 hang:
+# "client socket has timed out after 600000ms while trying to connect to 127.0.0.1:<port>".
+_TORCHRUN_ENV_EXACT = (
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "GROUP_WORLD_SIZE",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "ROLE_NAME",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+)
+_TORCHRUN_ENV_PREFIXES = ("TORCHELASTIC_", "PET_")
+
+
+def _torchrun_env_keys(env: dict[str, str] | None = None) -> list[str]:
+    """Names currently in `env` that torchrun/elastic set. Used by the isolator and tests."""
+    source = os.environ if env is None else env
+    keys = [name for name in _TORCHRUN_ENV_EXACT if name in source]
+    keys.extend(k for k in source if k.startswith(_TORCHRUN_ENV_PREFIXES))
+    # Preserve order but drop duplicates (exact names can also match a prefix).
+    seen: set[str] = set()
+    out: list[str] = []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+@contextmanager
+def isolated_from_torchrun() -> Iterator[None]:
+    """Strip torch.distributed launch env for the duration of vLLM engine construction.
+
+    Spawn copies `os.environ` at Process.start(), so this must wrap the call that
+    actually forks EngineCore / TP workers (`AsyncLLM.from_engine_args`). The parent
+    MUST restore the env before `init_process_group` -- the trainer ranks still need
+    RANK / WORLD_SIZE / MASTER_PORT.
+
+    Do not change CUDA_VISIBLE_DEVICES here. The parent may initialize CUDA later on
+    a trainer GPU; remapping visibility for spawn would also remap the parent if CUDA
+    is already live, and trainer rank 0 would lose cuda:4.
+    """
+    saved = {key: os.environ.pop(key) for key in _torchrun_env_keys()}
+    # Force the new TP TCPStore onto loopback. Without this, some workstation images
+    # advertise a non-loopback NIC and the workers never find each other.
+    host_ip_was_set = "VLLM_HOST_IP" in os.environ
+    os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
+    try:
+        yield
+    finally:
+        if not host_ip_was_set:
+            os.environ.pop("VLLM_HOST_IP", None)
+        os.environ.update(saved)
 
 
 class VLLMRolloutEngine(InferenceEngine):
@@ -80,7 +142,24 @@ class VLLMRolloutEngine(InferenceEngine):
 
     def start(self) -> None:
         """Build the AsyncLLM engine. vLLM is imported lazily so the rest of the package
-        stays importable on machines without it (e.g. the dev laptop running the tests)."""
+        stays importable on machines without it (e.g. the dev laptop running the tests).
+
+        Must run BEFORE the trainer `init_process_group`. vLLM's TP workers are spawned
+        from this process; if a default process group already exists (or torchrun's
+        RANK/WORLD_SIZE/MASTER_PORT/TORCHELASTIC_* still sit in the environment) they
+        try to join that rendezvous instead of creating their own TCPStore, and engine
+        init hangs for 600s on 127.0.0.1. Clearing three env vars is not enough -- the
+        elastic agent-store flag is what keeps workers pinned to torchrun's port.
+        """
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            raise RuntimeError(
+                "vLLM TP workers cannot be spawned after torch.distributed.init_process_group: "
+                "they inherit the trainer rendezvous and hang on TCPStore. Start the rollout "
+                "engine before initializing the trainer process group."
+            )
+
         from vllm import AsyncEngineArgs
         from vllm.config import WeightTransferConfig
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -102,8 +181,15 @@ class VLLMRolloutEngine(InferenceEngine):
             logprobs_mode="processed_logprobs",
         )
         # Synchronous: from_engine_args is not a coroutine, and the engine core process
-        # starts in __init__. There is no start()/await to call.
-        self.engine = AsyncLLM.from_engine_args(engine_args)
+        # starts in __init__. There is no start()/await to call. Isolation must wrap
+        # THIS call: spawn snapshots os.environ at Process.start().
+        stripped = _torchrun_env_keys()
+        with isolated_from_torchrun():
+            logger.info(
+                "starting rollout engine isolated from torchrun (stripped %s)",
+                stripped or "nothing",
+            )
+            self.engine = AsyncLLM.from_engine_args(engine_args)
         try:
             self.tokenizer = self.engine.get_tokenizer()
         except Exception:
