@@ -30,6 +30,39 @@ from train.utils import build_batch, SDPOBatch, response_logprobs_from_hidden
 logger = logging.getLogger(__name__)
 
 
+def _clip_grad_norm_mixed(parameters, max_norm: float) -> torch.Tensor:
+    """Global grad-norm clip when FSDP layers (DTensor) mix with replicated embed/lm_head.
+
+    `torch.nn.utils.clip_grad_norm_` foreach's `_foreach_norm` over the whole list and
+    dies with mixed Tensor/DTensor — the 4+4 crash after the first backward. Split the
+    two groups, norm each homogeneously (DTensor.norm all-reduces across shards), then
+    clip every grad by the combined coefficient.
+    """
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.zeros((), dtype=torch.float32)
+
+    def _local_sq_norm(group: list[torch.Tensor]) -> torch.Tensor:
+        norm = torch.nn.utils.get_total_norm(group, norm_type=2.0, foreach=True)
+        if isinstance(norm, DTensor):
+            norm = norm.full_tensor()
+        return norm.float().pow(2)
+
+    dtensor_grads = [g for g in grads if isinstance(g, DTensor)]
+    plain_grads = [g for g in grads if not isinstance(g, DTensor)]
+    total_sq = None
+    for group in (dtensor_grads, plain_grads):
+        if not group:
+            continue
+        sq = _local_sq_norm(group)
+        total_sq = sq if total_sq is None else total_sq + sq
+    total_norm = total_sq.sqrt()
+    clip_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+    for g in grads:
+        g.mul_(clip_coef)
+    return total_norm
+
+
 @dataclass
 class _RolloutStat:
     """
@@ -373,6 +406,9 @@ class SDPOTrainer:
             model.parameters(),
             lr=config.trainer.optimizer.learning_rate,
             weight_decay=config.trainer.optimizer.weight_decay,
+            # Default foreach=True would _foreach over mixed DTensor (FSDP layers)
+            # and plain embed/lm_head grads the same way clip_grad_norm_ did.
+            foreach=False,
         )
         # The send side of weight sync (WeightTransport). None on DDP ranks
         # 1..N-1 and in tests -- only rank 0 pushes weights to the rollout engines.
@@ -574,7 +610,7 @@ class SDPOTrainer:
             # number of microbatches processed
             n_micro += 1
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
+        grad_norm = _clip_grad_norm_mixed(
             self.model.parameters(), self.config.trainer.optimizer.max_grad_norm
         )
         self.optimizer.step()

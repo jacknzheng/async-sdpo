@@ -431,6 +431,37 @@ def test_packed_logprobs_forward_with_layer_fsdp():
         dist.destroy_process_group()
 
 
+def test_train_step_clips_mixed_dtensor_and_plain_grads():
+    """After layer-only FSDP, clip_grad_norm_ foreach dies on mixed DTensor/plain grads.
+    train_step must complete the optimizer update.
+    """
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    dist.init_process_group(
+        "gloo", init_method="tcp://127.0.0.1:29523", world_size=1, rank=0
+    )
+    try:
+        model = _model()
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("fsdp",))
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=mesh)
+        trainer = SDPOTrainer(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            config=make_config(batch_size=4, mini_batch_size=2),
+            tasks_by_id={"1": _task("1"), "2": _task("2")},
+            device="cpu",
+        )
+        metrics = trainer.train_step([_traj(), _traj(task_id="2")])
+        assert metrics["step"] == 1.0
+        assert torch.isfinite(torch.tensor(metrics["grad_norm"]))
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
+    finally:
+        dist.destroy_process_group()
+
+
 def test_send_weight_bucket_requires_setup():
     from train.backends.backend import WeightBucket
 
