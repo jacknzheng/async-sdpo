@@ -245,7 +245,9 @@ dataclasses — `+new.field=...` is rejected.
 **GPU split.** Rollout GPUs come first (vLLM's multiprocess workers pick `cuda:0..TP-1`
 by worker index); each trainer rank pins `cuda:{n_rollout_gpus + rank}`. 27B in bf16 does
 not fit on one 80 GB H100, so the trainer is **FSDP2**, not DDP: each transformer block is
-its own shard unit, then the root. 8B *would* fit as a full copy (~16 GB weights + 16 GB
+its own shard unit. Embeddings and `lm_head` stay replicated — the packed logprob path
+calls those submodules directly, and a sharded `embed_tokens` crashes with mixed
+Tensor/DTensor. 8B *would* fit as a full copy (~16 GB weights + 16 GB
 grads + 33 GB Adam ≈ 65 GB, hence `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) —
 if 27B OOMs after shrinking `mini_batch_size`, `model.model=Qwen/Qwen3-8B` is the fallback.
 The hinted teacher gets **no dedicated GPU**: it is the same weights as the student, run

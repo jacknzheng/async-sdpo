@@ -339,7 +339,7 @@ def test_unwrapped_peels_compile_wrapper_under_fsdp():
         mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("fsdp",))
         for layer in model.model.layers:
             fully_shard(layer, mesh=mesh)
-        fully_shard(model, mesh=mesh)
+        # Production wrapping: layers only, not the CausalLM root.
 
         trainer = SDPOTrainer(
             model=torch.compile(model),
@@ -376,8 +376,8 @@ def test_weight_buckets_gather_sharded_params_to_full_shape():
         mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("fsdp",))
         for layer in model.model.layers:
             fully_shard(layer, mesh=mesh)
-        fully_shard(model, mesh=mesh)
         assert any(isinstance(p.data, DTensor) for p in model.parameters())
+        assert not isinstance(model.model.embed_tokens.weight.data, DTensor)
 
         trainer = SDPOTrainer(
             model=model,
@@ -391,6 +391,42 @@ def test_weight_buckets_gather_sharded_params_to_full_shape():
                 assert not isinstance(tensor, DTensor), f"{name} shipped as a shard"
                 assert tuple(tensor.shape) == full_shapes[name], name
                 assert tuple(shape) == full_shapes[name], name
+    finally:
+        dist.destroy_process_group()
+
+
+def test_packed_logprobs_forward_with_layer_fsdp():
+    """The 4+4 first-step crash: fully_shard(root) makes embed_tokens a DTensor, then
+    `_response_logprobs` calls unwrapped.model with plain input_ids.
+
+    Production wrapping shards layers only. This forward must succeed.
+    """
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    dist.init_process_group(
+        "gloo", init_method="tcp://127.0.0.1:29521", world_size=1, rank=0
+    )
+    try:
+        model = _model()
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("fsdp",))
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=mesh)
+        trainer = SDPOTrainer(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            config=make_config(batch_size=4, mini_batch_size=2, compile_trainer=False),
+            tasks_by_id={"1": _task("1")},
+            device="cpu",
+        )
+        ids = torch.randint(0, 64, (2, 8))
+        attn = torch.ones_like(ids)
+        resp = torch.zeros_like(ids)
+        resp[:, 4:] = 1
+        out = trainer._response_logprobs(ids, attn, resp, max_response=4)
+        assert out.shape == (2, 4)
+        assert torch.isfinite(out).all()
     finally:
         dist.destroy_process_group()
 

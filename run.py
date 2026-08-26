@@ -167,14 +167,16 @@ def build_trainer(
         if config.trainer.fsdp.cpu_offload:
             fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=True)
 
-        # Shard each transformer block as its own FSDP unit, THEN the root. Without the
-        # per-layer pass the whole model becomes one unit and the all-gather would
-        # materialize every parameter at once, defeating the point of sharding. The root
-        # must come last: fully_shard sees already-sharded children and treats them as
-        # separate groups.
+        # Shard each transformer block as its own FSDP unit. Do NOT fully_shard the
+        # CausalLM root: `_response_logprobs` calls `unwrapped.model` (the inner
+        # backbone) and `lm_head` as submodules so the packed LM-head path never
+        # materializes [B, T, V] logits. If the root owns a sharded embed_tokens,
+        # that lookup is `F.embedding(plain input_ids, DTensor weight)` and dies
+        # with "aten.embedding.default got mixed torch.Tensor and DTensor" -- the
+        # 4+4 first-step crash on Baseten. Layers are the 27B; embed + lm_head
+        # (~1.5 GB bf16, often tied) stay replicated, which is cheap.
         for layer in model.model.layers:
             fully_shard(layer, **fsdp_kwargs)
-        fully_shard(model, **fsdp_kwargs)
 
     trainer = SDPOTrainer(
         model=model,

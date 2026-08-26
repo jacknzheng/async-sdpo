@@ -379,12 +379,16 @@ class SDPOTrainer:
         self.transport = transport
         # Flipped by setup_weight_sync(); guards against sending before the rendezvous.
         self._weight_sync_ready = False
-        # The FSDP2 root, resolved through the torch.compile wrapper: a compiled model is
-        # an OptimizedModule, so an isinstance check on self.model would miss it. FSDP2
-        # mutates the module in place rather than wrapping it, so this checks the
-        # unwrapped model against FSDPModule. None when single-GPU or under test.
+        # FSDP2 handle used as "are we sharded?" for checkpoint gather. Production
+        # shards each transformer block, not the CausalLM root (see run.py), so the
+        # HF module itself is often not an FSDPModule -- walk children.
         inner = getattr(model, "_orig_mod", model)
-        self._fsdp = inner if isinstance(inner, FSDPModule) else None
+        if isinstance(inner, FSDPModule) or any(
+            isinstance(m, FSDPModule) for m in inner.modules()
+        ):
+            self._fsdp = inner
+        else:
+            self._fsdp = None
 
     @property
     def unwrapped(self):
@@ -406,7 +410,8 @@ class SDPOTrainer:
         response_mask: torch.Tensor,
         max_response: int,
     ) -> torch.Tensor:
-        # FSDP shards live on these submodules (per-layer fully_shard + root).
+        # FSDP shards live on the transformer blocks (per-layer fully_shard). embed
+        # and lm_head stay replicated so this submodule call is a plain tensor op.
         backbone = self.unwrapped.model
         hidden = backbone(
             input_ids=input_ids,
