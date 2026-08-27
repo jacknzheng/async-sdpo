@@ -12,11 +12,25 @@ class StoreStats:
     sampled: int = 0
     evicted_stale: int = 0
     evicted_capacity: int = 0
-    hint_dropped:int = 0
+    hint_dropped: int = 0
+    hint_drop_openrouter_error: int = 0
+    hint_drop_timeout: int = 0
+    hint_drop_empty: int = 0
+    hint_drop_parse_fail: int = 0
+    hint_drop_other: int = 0
     staleness_histogram: Counter[int] = field(default_factory=Counter)
+
+    def count_hint_drop(self, cause: str) -> None:
+        self.hint_dropped += 1
+        key = f"hint_drop_{cause}"
+        if hasattr(self, key):
+            setattr(self, key, getattr(self, key) + 1)
+        else:
+            self.hint_drop_other += 1
 
     def as_metrics(self) -> dict[str, float]:
         total = sum(self.staleness_histogram.values())
+        hint_attempts = self.added + self.hint_dropped
         mean_staleness = (
             sum(k * v for k, v in self.staleness_histogram.items()) / total if total else 0.0
         )
@@ -28,8 +42,16 @@ class StoreStats:
             "store_mean_staleness": mean_staleness,
             "store_max_staleness_seen": float(max(self.staleness_histogram, default=0)),
             "store_hint_dropped_percent": float(
-                self.hint_dropped / self.added if self.added else 0.0
+                self.hint_dropped / hint_attempts if hint_attempts else 0.0
             ),
+            "store_hint_attempted": float(hint_attempts),
+            "store_hint_ok": float(self.added),
+            "store_hint_dropped": float(self.hint_dropped),
+            "hint_drop_openrouter_error": float(self.hint_drop_openrouter_error),
+            "hint_drop_timeout": float(self.hint_drop_timeout),
+            "hint_drop_empty": float(self.hint_drop_empty),
+            "hint_drop_parse_fail": float(self.hint_drop_parse_fail),
+            "hint_drop_other": float(self.hint_drop_other),
         }
 
 

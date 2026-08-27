@@ -315,6 +315,8 @@ def test_hint_receives_the_configured_prompt_variant(monkeypatch):
     assert seen["prompt_variant"] == "answer_bearing"
     assert seen["response_text"] == "the draft text"
     assert seen["query"] == "Assess the funding base."
+    assert seen["model"] == "z-ai/glm-5.3-flash"
+    assert seen["max_retries"] == 5
 
 
 def test_hint_concurrency_is_bounded(monkeypatch):

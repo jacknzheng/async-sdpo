@@ -623,6 +623,8 @@ class SDPOTrainer:
         averaged = {k: v / max(n_micro, 1) for k, v in accumulated.items()} # average stats across all microbatches
         averaged["grad_norm"] = float(grad_norm)
         averaged["step"] = float(self.state.step)
+        averaged["lr"] = float(self.optimizer.param_groups[0]["lr"])
+        averaged["tokens"] = float(batch.response_mask.sum().item())
         averaged["mean_batch_staleness"] = float(
             (self.state.policy_version - batch.policy_versions.float()).mean() # tracks staleness average by comparing our trainer state's policy version (updated through weight syncs) and each labelled sample's policy
         )
@@ -833,7 +835,8 @@ def log_metrics(metrics: dict[str, float], store: TrajectoryStore) -> None:
     gap = combined.get("teacher_minus_student_logp", 0.0)
     logger.info(
         "step %d | loss %.4f | teacher-student gap %+.4f | adv_clip %.1f%% | "
-        "ratio_clip lo %.1f%% hi %.1f%% | staleness %.2f | grad %.3f",
+        "ratio_clip lo %.1f%% hi %.1f%% | staleness %.2f (max %d) | grad %.3f | "
+        "lr %.2e | tokens %d | hint_drop %.1f%%",
         int(combined.get("step", 0)),
         combined.get("loss", 0.0),
         gap,
@@ -841,7 +844,11 @@ def log_metrics(metrics: dict[str, float], store: TrajectoryStore) -> None:
         100 * combined.get("ratio_clip_frac_low", 0.0),
         100 * combined.get("ratio_clip_frac_high", 0.0),
         combined.get("store_mean_staleness", 0.0),
+        int(combined.get("store_max_staleness_seen", 0)),
         combined.get("grad_norm", 0.0),
+        combined.get("lr", 0.0),
+        int(combined.get("tokens", 0)),
+        100 * combined.get("store_hint_dropped_percent", 0.0),
     )
     if abs(gap) < 1e-3:
         logger.warning(

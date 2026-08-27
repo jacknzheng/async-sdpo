@@ -94,7 +94,9 @@ class BaseConfig(ABC):
 
 @dataclass(frozen=True)
 class ModelConfig(BaseConfig):
-    model: str = "Qwen/Qwen3.8-27B"
+    # Proven 4+4 workstation default. The 27B rollout engine's custom all-reduce
+    # requires GPU P2P/IPC, which conflicts with NCCL_P2P_DISABLE=1 on Baseten.
+    model: str = "Qwen/Qwen3-8B"
     smoke_model: str = "Qwen/Qwen3-0.6B"
     dtype: str = "bfloat16"
 
@@ -118,9 +120,12 @@ HINT_PROMPTS = (
 @dataclass(frozen=True)
 class HintConfig(BaseConfig):
     prompt: str = "gold"
-    model: str = "stealth/ox-alpha"
-    concurrency: int = 8
-    timeout: float = 60.0
+    # OpenRouter retired stealth/ox-alpha and identified this as the same
+    # underlying model's permanent slug.
+    model: str = "z-ai/glm-5.3-flash"
+    concurrency: int = 4
+    timeout: float = 90.0
+    max_retries: int = 5
 
     def __post_init__(self) -> None:
         if self.prompt not in HINT_PROMPTS:
@@ -129,6 +134,8 @@ class HintConfig(BaseConfig):
             )
         if self.concurrency < 1:
             raise ValueError("generator.hint.concurrency must be >= 1")
+        if self.max_retries < 1:
+            raise ValueError("generator.hint.max_retries must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -144,6 +151,9 @@ class InferenceEngineConfig(BaseConfig):
     weight_sync_port: int = 51216
     weight_sync_timeout_s: float = 180.0
     weight_sync_bucket_mb: int = 512
+    # NCCL_P2P_DISABLE=1 is required by weight sync on the target workstations.
+    # vLLM's custom TP all-reduce assumes P2P/IPC, so use its NCCL fallback.
+    disable_custom_all_reduce: bool = True
 
     def __post_init__(self) -> None:
         from train.backends import BACKEND_NAMES
@@ -230,7 +240,7 @@ class TrainerConfig(BaseConfig):
     n_trainer_gpus: int = 4
     batch_size: int = 16             # divisible by 4
     eval_batch_size: int = 16
-    mini_batch_size: int = 4
+    mini_batch_size: int = 2
 
     gradient_checkpointing: bool = True
     
@@ -267,7 +277,7 @@ class DataConfig(BaseConfig):
     n_heldout: int = 27
     split_seed: int = 0
     retrieval: str = "alltools-qwen"
-    user_llm: str = "openrouter/stealth/ox-alpha"
+    user_llm: str = "openrouter/z-ai/glm-5.3-flash"
     # Parallel Search (diligence TIR only). https://docs.parallel.ai/search/search-quickstart
     search_mode: str = "fast"
     search_timeout: float = 30.0
@@ -292,9 +302,9 @@ class DataConfig(BaseConfig):
 
 @dataclass(frozen=True)
 class JudgeConfig(BaseConfig):
-    model: str = "stealth/ox-alpha"
-    max_concurrency: int = 8
-    max_retries: int = 3
+    model: str = "z-ai/glm-5.3-flash"
+    max_concurrency: int = 4
+    max_retries: int = 5
     timeout: float = 120.0
     eval_interval: int = 25
 

@@ -7,6 +7,10 @@ import os
 import sys
 from pathlib import Path
 
+# huggingface_hub snapshots this at import time. Anonymous or cold model pulls on
+# workstation disks regularly exceed its short default read timeout.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+
 def _prepend_vllm_cudart() -> None:
     """vLLM 0.26's PyPI wheel links libcudart.so.13; this box's torch is cu128.
 
@@ -275,10 +279,12 @@ async def generate_trajectory(
     # generate the hint before adding to the store!
     hints = await generate_hint(config, task, result.text)
     if not hints.ok(config.generator.hint.prompt):
-        store.stats.hint_dropped += 1
+        cause = hints.cause or "other"
+        store.stats.count_hint_drop(cause)
         logger.warning(
-            "dropping rollout for task %s: no hint could be generated",
+            "dropping rollout for task %s: no hint could be generated (cause=%s)",
             task.task_id,
+            cause,
         )
         await staleness_manager.on_rollout_rejected()
         return

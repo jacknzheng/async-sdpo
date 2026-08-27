@@ -78,7 +78,7 @@ disagrees" and is the entire point.
 
 ## Run it (8×H100)
 
-Default stack: `Qwen/Qwen3.8-27B`, 4 vLLM rollout GPUs + 4 FSDP2 trainer ranks, max
+Default stack: `Qwen/Qwen3-8B`, 4 vLLM rollout GPUs + 4 FSDP2 trainer ranks, max
 staleness K=3, `vllm==0.26.x` and `torch==2.11.0+cu128` pinned exactly. Python 3.12.
 Do not let uv pull torch 2.13 (CUDA 13) — it will not load on a 12.8 driver.
 
@@ -231,9 +231,9 @@ dataclasses — `+new.field=...` is rejected.
 
 | Setting            | Value                             | Notes                       |
 | ------------------ | --------------------------------- | --------------------------- |
-| model              | `Qwen/Qwen3.8-27B`                | smoke: `Qwen/Qwen3-0.6B`    |
+| model              | `Qwen/Qwen3-8B`                   | smoke: `Qwen/Qwen3-0.6B`    |
 | GPUs               | 4 rollout / 4 trainer (FSDP2)     | see below                   |
-| batch / mini-batch | 16 / 4                            | must divide trainer world   |
+| batch / mini-batch | 16 / 2                            | proven 4+4 memory setting   |
 | max staleness K    | 3                                 | blog + confirmed            |
 | clip window        | `clip(r, 0.8, 1.4)`               | must contain 1.0            |
 | advantage clip     | 3.0x EMA (decay 0.99)             | blog (3x); EMA spec is ours |
@@ -243,13 +243,14 @@ dataclasses — `+new.field=...` is rejected.
 | total steps        | 500                               | eval every 25               |
 
 **GPU split.** Rollout GPUs come first (vLLM's multiprocess workers pick `cuda:0..TP-1`
-by worker index); each trainer rank pins `cuda:{n_rollout_gpus + rank}`. 27B in bf16 does
-not fit on one 80 GB H100, so the trainer is **FSDP2**, not DDP: each transformer block is
-its own shard unit. Embeddings and `lm_head` stay replicated — the packed logprob path
-calls those submodules directly, and a sharded `embed_tokens` crashes with mixed
-Tensor/DTensor. 8B *would* fit as a full copy (~16 GB weights + 16 GB
-grads + 33 GB Adam ≈ 65 GB, hence `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) —
-if 27B OOMs after shrinking `mini_batch_size`, `model.model=Qwen/Qwen3-8B` is the fallback.
+by worker index); each trainer rank pins `cuda:{n_rollout_gpus + rank}`. The proven
+workstation default is 8B (~16 GB weights + 16 GB grads + 33 GB Adam ≈ 65 GB, hence
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`). 27B remains available via
+`model.model=Qwen/Qwen3.8-27B`, but its vLLM TP=4 custom all-reduce requires GPU P2P/IPC,
+which conflicts with the target image's `NCCL_P2P_DISABLE=1`; the config therefore uses
+vLLM's NCCL all-reduce fallback. The trainer remains **FSDP2** in both cases. Embeddings
+and `lm_head` stay replicated — the packed logprob path calls those submodules directly,
+and a sharded `embed_tokens` crashes with mixed Tensor/DTensor.
 The hinted teacher gets **no dedicated GPU**: it is the same weights as the student, run
 under `no_grad` on each trainer rank. That keeps TP=4 on the rollout side (a power of two).
 
@@ -275,14 +276,17 @@ for the first ~100 steps — exactly when training is least stable.
 ## Hints are error-conditioned
 
 On diligence (and tau2 `step_hint`), every hint is written **per rollout** by an LLM
-(`stealth/ox-alpha` on OpenRouter) that reads the draft the student actually produced.
+(`z-ai/glm-5.3-flash` on OpenRouter, the permanent slug for the retired
+`stealth/ox-alpha`) that reads the draft the student actually produced.
 Two rollouts of the same task get different hints. Tau2 `gold` skips the LLM and injects
 Sierra gold / the canonical tool trajectory instead.
 
 A rollout whose hint cannot be generated is **dropped**, not trained with an empty hint:
 an unhinted teacher is identical to the student and would contribute ~zero gradient. Watch
-`store_hint_dropped_percent` (and `store.stats.hint_dropped`). A sustained nonzero value
-means the hint model, not the rollout engine, is the bottleneck on data production.
+`store_hint_dropped_percent` and the per-cause `hint_drop_*` counters. The percentage is
+drops / (successful + dropped hint attempts), so it stays in [0%, 100%]. A sustained
+nonzero value means the hint model, not the rollout engine, is the bottleneck on data
+production.
 
 ## What to watch (and what to fix)
 

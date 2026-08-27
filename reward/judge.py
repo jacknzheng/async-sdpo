@@ -118,11 +118,11 @@ async def chat_completion(
     `response_format` and the provider filter, since requiring structured-output support
     would needlessly narrow routing for a plain-prose request.
 
-    When a schema IS requested, we first ask for strict `json_schema` +
-    `provider.require_parameters`. OpenRouter 404s that combination on several models
-    ("No endpoints found that can handle the requested parameters") -- including the
-    default judge -- so a 404 / unroutable schema falls back to `json_object` without
-    the provider filter. Hints never take this path.
+    When a schema IS requested, models normally try strict `json_schema` +
+    `provider.require_parameters`, then fall back to `json_object` if that route is
+    unavailable. GLM uses `json_object` directly because OpenRouter's strict filter
+    sends it to an overloaded shared pool; the parsed result is still schema-validated.
+    Hints never take this path.
 
     `parse` runs INSIDE the retry loop. That placement matters: a schema violation is
     transient -- the model emitted prose or a truncated object, and a resample usually
@@ -132,7 +132,13 @@ async def chat_completion(
     Raises TerminalJudgeError for failures a retry cannot fix; retries everything else.
     """
     modes: list[str | None]
-    if response_schema is not None:
+    if response_schema is not None and model == "z-ai/glm-5.3-flash":
+        # OpenRouter's strict-schema filter currently routes GLM to a shared
+        # DeepInfra pool that frequently returns upstream 429s. json_object
+        # routes to Z.AI and is still validated below with
+        # OneShotOutput.model_validate_json, so malformed output cannot score.
+        modes = ["json_object"]
+    elif response_schema is not None:
         modes = ["json_schema", "json_object"]
     else:
         modes = [None]
@@ -159,6 +165,15 @@ async def chat_completion(
             if i + 1 < len(modes) and _structured_output_unroutable(exc):
                 logger.warning(
                     "strict json_schema unroutable on OpenRouter; falling back to json_object: %s",
+                    exc,
+                )
+                last_error = exc
+                continue
+            raise
+        except RuntimeError as exc:
+            if i + 1 < len(modes):
+                logger.warning(
+                    "strict json_schema failed after retries; falling back to json_object: %s",
                     exc,
                 )
                 last_error = exc
@@ -287,7 +302,7 @@ class OpenRouterOneShotGenerator:
 
     def __init__(
         self,
-        model: str = "stealth/ox-alpha",
+        model: str = "z-ai/glm-5.3-flash",
         max_retries: int = 3,
         max_tokens: int = 16000,
         timeout: float = 120.0,
@@ -319,7 +334,7 @@ class RubricJudge:
 
     def __init__(
         self,
-        model: str = "stealth/ox-alpha",
+        model: str = "z-ai/glm-5.3-flash",
         max_concurrency: int = 8,
         max_retries: int = 3,
         timeout: float = 120.0,
@@ -346,6 +361,12 @@ class RubricJudge:
                     query=task.query,
                 )
             except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "judge failed for task %s: %s: %s",
+                    task.task_id,
+                    type(exc).__name__,
+                    exc,
+                )
                 return JudgeResult(task_id=task.task_id, score=0.0, raw_score=0.0, error=str(exc))
 
         return JudgeResult(

@@ -211,11 +211,11 @@ def test_valid_response_parses(monkeypatch):
 
 
 def test_request_payload_is_correct(monkeypatch):
-    gen, sent = _generator(monkeypatch, [_ok()], model="stealth/ox-alpha")
+    gen, sent = _generator(monkeypatch, [_ok()], model="provider/strict-model")
     asyncio.run(gen("SYSTEM PROMPT", "USER PROMPT"))
 
     payload = json.loads(sent[0]["data"])
-    assert payload["model"] == "stealth/ox-alpha"
+    assert payload["model"] == "provider/strict-model"
     # A non-deterministic judge would inject sampling noise into the eval curve itself.
     assert payload["temperature"] == 0.0
     assert payload["reasoning"] == {"enabled": True}
@@ -228,6 +228,16 @@ def test_request_payload_is_correct(monkeypatch):
     assert payload["provider"]["require_parameters"] is True
     assert sent[0]["headers"]["Authorization"] == "Bearer test-key"
     assert sent[0]["timeout"] == 120.0
+
+
+def test_glm_uses_json_object_route_with_schema_validation(monkeypatch):
+    gen, sent = _generator(monkeypatch, [_ok()])
+    asyncio.run(gen("sys", "user"))
+
+    payload = json.loads(sent[0]["data"])
+    assert payload["model"] == "z-ai/glm-5.3-flash"
+    assert payload["response_format"] == {"type": "json_object"}
+    assert "provider" not in payload
 
 
 def test_strict_schema_sets_additional_properties_false_everywhere():
@@ -288,7 +298,12 @@ def test_json_schema_404_falls_back_to_json_object(monkeypatch):
         status_code=404,
         text="No endpoints found that can handle the requested parameters",
     )
-    gen, sent = _generator(monkeypatch, [schema_404, _ok()], max_retries=3)
+    gen, sent = _generator(
+        monkeypatch,
+        [schema_404, _ok()],
+        model="provider/strict-model",
+        max_retries=3,
+    )
     output = asyncio.run(gen("sys", "user"))
     assert output.criteria_evaluations[0].criterion_status == "MET"
     assert len(sent) == 2
@@ -298,6 +313,20 @@ def test_json_schema_404_falls_back_to_json_object(monkeypatch):
     assert first["provider"]["require_parameters"] is True
     assert second["response_format"] == {"type": "json_object"}
     assert "provider" not in second
+
+
+def test_exhausted_strict_route_falls_back_to_json_object(monkeypatch):
+    gen, sent = _generator(
+        monkeypatch,
+        [FakeResponse(status_code=503), _ok()],
+        model="provider/strict-model",
+        max_retries=1,
+    )
+    output = asyncio.run(gen("sys", "user"))
+    assert output.criteria_evaluations[0].criterion_status == "MET"
+    assert len(sent) == 2
+    assert json.loads(sent[0]["data"])["response_format"]["type"] == "json_schema"
+    assert json.loads(sent[1]["data"])["response_format"] == {"type": "json_object"}
 
 
 def test_json_schema_400_does_not_fall_back(monkeypatch):

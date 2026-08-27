@@ -98,15 +98,19 @@ def test_gold_and_step_hint_prompts_accepted():
     )
 
 
-def test_default_is_tau2_27b():
+def test_default_is_proven_tau2_8b_stack():
     cfg = Config()
     assert cfg.data.dataset == "tau2"
-    assert cfg.model.model == "Qwen/Qwen3.8-27B"
+    assert cfg.model.model == "Qwen/Qwen3-8B"
     assert cfg.trainer.gradient_checkpointing is True
-    assert cfg.trainer.mini_batch_size == 4
+    assert cfg.trainer.mini_batch_size == 2
     assert cfg.trainer.batch_size == 16
     assert cfg.generator.engine.max_model_len == 16384
+    assert cfg.generator.engine.disable_custom_all_reduce is True
     assert cfg.generator.hint.prompt == "gold"
+    assert cfg.generator.hint.model == "z-ai/glm-5.3-flash"
+    assert cfg.data.user_llm == "openrouter/z-ai/glm-5.3-flash"
+    assert cfg.judge.model == "z-ai/glm-5.3-flash"
     assert cfg.logging.log_dir == "/log"
     assert cfg.logging.wandb_enabled is True
     assert cfg.trainer.algorithm.use_sod is True
@@ -127,6 +131,11 @@ def test_unknown_search_mode_rejected():
 def test_zero_hint_concurrency_rejected():
     with pytest.raises(ValueError, match="concurrency"):
         Config.from_cli_overrides(["generator.hint.concurrency=0"])
+
+
+def test_zero_hint_retries_rejected():
+    with pytest.raises(ValueError, match="max_retries"):
+        Config.from_cli_overrides(["generator.hint.max_retries=0"])
 
 
 # ---- the nesting machinery itself ----

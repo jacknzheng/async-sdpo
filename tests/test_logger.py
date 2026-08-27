@@ -36,7 +36,7 @@ def test_setup_writes_args_config_and_train_log(tmp_path: Path):
     assert "trainer.total_steps=50" in args_text
     assert "hint: gold" in args_text
     yaml_text = (ctx.log_dir / "config.yaml").read_text(encoding="utf-8")
-    assert "Qwen/Qwen3.8-27B" in yaml_text
+    assert "Qwen/Qwen3-8B" in yaml_text
     assert Config.from_dict_config(__import__("yaml").safe_load(yaml_text))
     train_log = ctx.log_dir / "train.log"
     assert train_log.exists()

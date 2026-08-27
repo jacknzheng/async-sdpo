@@ -178,3 +178,20 @@ def test_metrics_expose_staleness_distribution():
     assert metrics["store_mean_staleness"] == pytest.approx(1.0)
     assert metrics["store_max_staleness_seen"] == 2.0
     assert metrics["store_policy_version"] == 5.0
+
+
+def test_hint_drop_percent_uses_all_attempts_and_tracks_cause():
+    async def run():
+        store = TrajectoryStore(capacity=20)
+        for i in range(10):
+            await store.add(_traj(task_id=str(i)))
+        for _ in range(20):
+            store.stats.count_hint_drop("openrouter_error")
+        return store.metrics()
+
+    metrics = asyncio.run(run())
+    assert metrics["store_hint_attempted"] == 30.0
+    assert metrics["store_hint_ok"] == 10.0
+    assert metrics["store_hint_dropped"] == 20.0
+    assert metrics["store_hint_dropped_percent"] == pytest.approx(2 / 3)
+    assert metrics["hint_drop_openrouter_error"] == 20.0

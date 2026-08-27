@@ -174,6 +174,10 @@ def init_wandb(config: Config, ctx: RunContext):
             dir=str(ctx.log_dir),
             notes=ctx.cli,
         )
+        # Eval runs asynchronously and may finish after training has advanced.
+        # Give eval its own x-axis instead of attempting an out-of-order global step.
+        run.define_metric("eval/launched_at_step")
+        run.define_metric("eval/*", step_metric="eval/launched_at_step")
     except Exception:
         logging.getLogger("sdpo").exception(
             "wandb.init failed; continuing with file logs only"
@@ -265,6 +269,6 @@ async def evaluate_and_log(
         except ImportError:
             return
         if wandb.run is not None:
-            wandb.log(payload, step=step)
+            wandb.log(payload)
     except Exception:
         logger.exception("eval failed (launched at step %d)", step)

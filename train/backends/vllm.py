@@ -176,6 +176,9 @@ class VLLMRolloutEngine(InferenceEngine):
             enforce_eager=False,
             enable_prefix_caching=True,
             max_model_len=self.config.generator.engine.max_model_len,
+            disable_custom_all_reduce=(
+                self.config.generator.engine.disable_custom_all_reduce
+            ),
             seed=self.seed,
             # includes sampling adjustments: top_k, temperature, etc.
             logprobs_mode="processed_logprobs",

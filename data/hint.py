@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import logging
 import asyncio
+import contextvars
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,10 @@ from data.dataset import Task
 from reward.judge import chat_completion
 
 logger = logging.getLogger(__name__)
+
+_hint_cause: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hint_cause", default=""
+)
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -21,10 +26,11 @@ ERROR_HINT_PROMPTS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class Hints:
-    """One rollout's teacher contexts. Mixture fills both; a single arm fills one."""
+    """One rollout's teacher contexts and any generation failure cause."""
 
     free: str = ""
     bearing: str = ""
+    cause: str = ""
 
     def ok(self, mode: str) -> bool:
         if mode == "mixture":
@@ -55,13 +61,12 @@ async def build_error_hint(
     sections: list[dict] | None = None,
     response_text: str = "",
     prompt_variant: str = "answer_free",
-    model: str = "stealth/ox-alpha",
-    timeout: float = 60.0,
-    max_retries: int = 2,
+    model: str = "z-ai/glm-5.3-flash",
+    timeout: float = 90.0,
+    max_retries: int = 5,
     user_prompt: str | None = None,
 ) -> str:
-
-
+    _hint_cause.set("")
     if prompt_variant not in ERROR_HINT_PROMPTS:
         raise ValueError(
             f"unknown hint prompt {prompt_variant!r}; choose from {sorted(ERROR_HINT_PROMPTS)}"
@@ -69,6 +74,8 @@ async def build_error_hint(
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
+        _hint_cause.set("openrouter_error")
+        logger.warning("OPENROUTER_API_KEY is unset; cannot generate %s hint", prompt_variant)
         return ""
 
     if user_prompt is None:
@@ -88,12 +95,28 @@ async def build_error_hint(
             timeout=timeout,
             max_retries=max_retries,
         )
-    except Exception:  # noqa: BLE001 -- a hint failure must never break a rollout
-        logger.debug("error-hint generation failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 -- a hint failure must never break a rollout
+        text = str(exc).lower()
+        cause = (
+            "timeout"
+            if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+            or "timeout" in text
+            or "timed out" in text
+            else "openrouter_error"
+        )
+        _hint_cause.set(cause)
+        logger.warning(
+            "error-hint generation failed (variant=%s, cause=%s): %s: %s",
+            prompt_variant,
+            cause,
+            type(exc).__name__,
+            exc,
+        )
         return ""
 
     generated = generated.strip()
     if not generated:
+        _hint_cause.set("empty")
         return ""
     if prompt_variant == "step_hint":
         return generated
@@ -102,6 +125,7 @@ async def build_error_hint(
 # initialize hint rate limiter to None
 _HINT_SEM: asyncio.Semaphore | None = None
 
+
 def _hint_sem(concurrency: int) -> asyncio.Semaphore:
     global _HINT_SEM
     if _HINT_SEM is None:
@@ -109,16 +133,24 @@ def _hint_sem(concurrency: int) -> asyncio.Semaphore:
     return _HINT_SEM
 
 
-async def _one_hint(config: Config, task: Task, response_text: str, variant: str) -> str:
+def _cause_for(text: str) -> str:
+    return "" if text else (_hint_cause.get() or "empty")
+
+
+async def _one_hint(
+    config: Config, task: Task, response_text: str, variant: str
+) -> tuple[str, str]:
     async with _hint_sem(config.generator.hint.concurrency):
-        return await build_error_hint(
+        text = await build_error_hint(
             query=task.query,
             sections=task.sections,
             response_text=response_text,
             prompt_variant=variant,
             model=config.generator.hint.model,
             timeout=config.generator.hint.timeout,
+            max_retries=config.generator.hint.max_retries,
         )
+    return text, _cause_for(text)
 
 
 async def generate_hint(config: Config, task: Task, response_text: str) -> Hints:
@@ -127,7 +159,8 @@ async def generate_hint(config: Config, task: Task, response_text: str) -> Hints
         if mode == "gold":
             from data.tau_harness import gold_suffix
 
-            return Hints(free=gold_suffix(task))
+            text = gold_suffix(task)
+            return Hints(free=text, cause="" if text else "empty")
         if mode == "step_hint":
             from data.tau_harness import gold_material
 
@@ -140,17 +173,26 @@ async def generate_hint(config: Config, task: Task, response_text: str) -> Hints
                     ),
                     model=config.generator.hint.model,
                     timeout=config.generator.hint.timeout,
+                    max_retries=config.generator.hint.max_retries,
                 )
-            return Hints(free=text)
+            return Hints(free=text, cause=_cause_for(text))
         if mode == "mixture":
-            free, bearing = await asyncio.gather(
+            (free, free_cause), (bearing, bearing_cause) = await asyncio.gather(
                 _one_hint(config, task, response_text, "answer_free"),
                 _one_hint(config, task, response_text, "answer_bearing"),
             )
-            return Hints(free=free, bearing=bearing)
+            return Hints(
+                free=free,
+                bearing=bearing,
+                cause=free_cause or bearing_cause,
+            )
         if mode == "answer_bearing":
-            return Hints(bearing=await _one_hint(config, task, response_text, "answer_bearing"))
-        return Hints(free=await _one_hint(config, task, response_text, "answer_free"))
+            text, cause = await _one_hint(
+                config, task, response_text, "answer_bearing"
+            )
+            return Hints(bearing=text, cause=cause)
+        text, cause = await _one_hint(config, task, response_text, "answer_free")
+        return Hints(free=text, cause=cause)
     except Exception:
         logger.exception("error-hint failed for task %s", task.task_id)
-        return Hints()
+        return Hints(cause="other")
