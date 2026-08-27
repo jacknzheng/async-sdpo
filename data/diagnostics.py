@@ -17,6 +17,7 @@ from typing import Any
 
 ARTIFACT_FILES = {
     "api_failures": "api_failures.jsonl",
+    "evaluations": "evaluations.jsonl",
     "rollouts": "rollouts.jsonl",
     "sandbox": "sandbox.jsonl",
     "training": "training.jsonl",

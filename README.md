@@ -151,9 +151,12 @@ Dotted overrides after the mode, e.g. `bash scripts/run_taubench.sh gold trainer
 Logs land in `/log/<run_name>/`; if `/log` is not writable the scripts fall
 back to `./log`. `ARTIFACTS.txt` describes every file: `console.log` includes
 vLLM subprocess output, `train.log` and `rankN.log` contain Python logs, and
-the structured `api_failures.jsonl`, `rollouts.jsonl`, `sandbox.jsonl`,
-`training.jsonl`, and `vllm.jsonl` streams retain failure context, complete
-episodes, tool activity, per-step metrics, and generation lifecycles.
+the structured `api_failures.jsonl`, `evaluations.jsonl`, `rollouts.jsonl`,
+`sandbox.jsonl`, `training.jsonl`, and `vllm.jsonl` streams retain failure
+context, per-task held-out outputs and scores, complete episodes, tool
+activity, per-step metrics, and generation lifecycles. Evaluation blocks
+training at each `judge.eval_interval` boundary (25 steps by default), so an
+evaluation is neither skipped nor mislabeled after later weight updates.
 `scripts/setup_tau2_sandbox.sh` also writes a timestamped
 `tau2-sandbox-setup-*.log`. Checkpoints go to `runs/sdpo-tau2/` or
 `runs/sdpo-diligence/`. Wandb projects: `sdpo-tau2` / `sdpo-diligence`.

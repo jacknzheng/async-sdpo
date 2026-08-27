@@ -100,9 +100,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from train.config import Config  # noqa: E402
 from train.logger import (  # noqa: E402
     RunContext,
-    evaluate,
     evaluate_and_log,
-    evaluate_pass1,
     init_wandb,
     setup_run_logging,
 )
@@ -577,7 +575,6 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
     judge = None
     stop = None
     rollout_task = None
-    eval_task = None
 
     if rank == 0:
         store = TrajectoryStore(
@@ -696,32 +693,19 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                             {**metrics, **store.metrics()}, step=trainer.state.step
                         )
                 if trainer.state.step % config.judge.eval_interval == 0:
-                    if eval_task is not None and not eval_task.done():
-                        logger.warning(
-                            "skipping eval at step %d: previous still running",
-                            trainer.state.step,
-                        )
-                    else:
-                        launched_step = trainer.state.step
-                        launched_version = trainer.state.policy_version
-                        eval_task = asyncio.create_task(
-                            evaluate_and_log(
-                                engine,
-                                judge,
-                                heldout_tasks,
-                                launched_step,
-                                launched_version,
-                                dataset=config.data.dataset,
-                                max_concurrency=config.judge.max_concurrency,
-                            )
-                        )
-                        eval_task.add_done_callback(
-                            lambda t: (
-                                t.exception()
-                                if not t.cancelled() and t.exception()
-                                else None
-                            )
-                        )
+                    # Block the next optimizer/weight-sync step until eval
+                    # finishes. Otherwise a long asynchronous eval can span
+                    # several policy versions and the next 25-step boundary
+                    # is silently skipped.
+                    await evaluate_and_log(
+                        engine,
+                        judge,
+                        heldout_tasks,
+                        trainer.state.step,
+                        trainer.state.policy_version,
+                        dataset=config.data.dataset,
+                        max_concurrency=config.judge.max_concurrency,
+                    )
 
             # All ranks enter: FSDP gather inside state_dict(); rank 0 writes.
             if trainer.state.step % config.logging.checkpoint_interval == 0:
@@ -730,16 +714,12 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                 )
 
         save_checkpoint(trainer, config.logging.output_dir, "final")
-        if rank == 0 and eval_task is not None and not eval_task.done():
-            await eval_task
     finally:
         if rank == 0:
             if stop is not None:
                 stop.set()
             if rollout_task is not None:
                 rollout_task.cancel()
-            if eval_task is not None and not eval_task.done():
-                eval_task.cancel()
             if engine is not None:
                 await engine.shutdown()
             if wandb is not None:
@@ -755,23 +735,27 @@ async def baseline(config: Config, ctx: RunContext | None = None) -> None:
     engine = engine_cls(config)
     engine.start()
     try:
-        if config.data.dataset == "tau2":
-            metrics = await evaluate_pass1(
-                engine, heldout, max_concurrency=config.judge.max_concurrency
-            )
-        else:
+        judge = None
+        if config.data.dataset != "tau2":
             judge = RubricJudge(
                 config.judge.model,
                 config.judge.max_concurrency,
                 config.judge.max_retries,
                 config.judge.timeout,
             )
-            metrics = await evaluate(
-                engine, judge, heldout, max_concurrency=config.judge.max_concurrency
-            )
+        metrics = await evaluate_and_log(
+            engine,
+            judge,
+            heldout,
+            0,
+            0,
+            dataset=config.data.dataset,
+            max_concurrency=config.judge.max_concurrency,
+        )
+        if metrics is None:
+            raise RuntimeError("baseline evaluation failed; inspect evaluations.jsonl")
         logger.info("ZERO-SHOT BASELINE: %s", metrics)
         if wandb is not None:
-            wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=0)
             wandb.summary.update(metrics)
     finally:
         await engine.shutdown()

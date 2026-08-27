@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -119,6 +120,7 @@ def setup_run_logging(
                     "train.log             rank-0 Python logs and training metrics",
                     "rankN.log             nonzero FSDP-rank Python logs",
                     "api_failures.jsonl    OpenRouter, Parallel, judge, and user-sim failures",
+                    "evaluations.jsonl     per-task eval outputs, scores, errors, and aggregates",
                     "rollouts.jsonl        complete messages, transcripts, hints, and outcomes",
                     "sandbox.jsonl         tau2 preflight, environment, tool, and scoring events",
                     "training.jsonl        per-step metrics, task IDs, and policy versions",
@@ -228,6 +230,9 @@ async def evaluate(
     judge: RubricJudge,
     tasks,
     max_concurrency: int = 8,
+    *,
+    launched_at_step: int | None = None,
+    policy_version: int | None = None,
 ) -> dict[str, float]:
     """Generate on held-out tasks (with web search) and score with the rubric judge.
 
@@ -262,9 +267,48 @@ async def evaluate(
                 error_type=type(result).__name__,
                 error=str(result),
             )
+            artifact_event(
+                "evaluations",
+                "evaluation_task_failed",
+                dataset="diligence",
+                launched_at_step=launched_at_step,
+                policy_version=policy_version,
+                task_id=task.task_id,
+                domain=getattr(task, "domain", None),
+                stage="rollout",
+                error_type=type(result).__name__,
+                error=str(result),
+            )
             continue
-        successful.append((task, result.text))
-    scored = await judge.score_all(successful)
+        successful.append((task, result))
+    scored = await judge.score_all(
+        [(task, result.text) for task, result in successful]
+    )
+    for (task, result), judged in zip(successful, scored):
+        artifact_event(
+            "evaluations",
+            "evaluation_task_completed",
+            dataset="diligence",
+            launched_at_step=launched_at_step,
+            policy_version=policy_version,
+            task_id=task.task_id,
+            domain=getattr(task, "domain", None),
+            query=task.query,
+            response_text=result.text,
+            prompt_tokens=len(result.prompt_token_ids),
+            response_tokens=len(result.response_token_ids),
+            score=judged.score,
+            raw_score=judged.raw_score,
+            sections={
+                name: {
+                    "earned": section.earned,
+                    "possible": section.possible,
+                    "fraction": section.fraction,
+                }
+                for name, section in judged.sections.items()
+            },
+            judge_error=judged.error,
+        )
     metrics = summarize(scored)
     metrics["eval_rollout_errors"] = float(rollout_errors)
     metrics["eval_requested"] = float(len(tasks))
@@ -272,7 +316,12 @@ async def evaluate(
 
 
 async def evaluate_pass1(
-    engine: InferenceEngine, tasks, max_concurrency: int = 8
+    engine: InferenceEngine,
+    tasks,
+    max_concurrency: int = 8,
+    *,
+    launched_at_step: int | None = None,
+    policy_version: int | None = None,
 ) -> dict[str, float]:
     """Held-out tau2 pass^1 overall and per domain."""
     sem = asyncio.Semaphore(max_concurrency)
@@ -306,12 +355,38 @@ async def evaluate_pass1(
                 error_type=type(outcome).__name__,
                 error=str(outcome),
             )
+            artifact_event(
+                "evaluations",
+                "evaluation_task_failed",
+                dataset="tau2",
+                launched_at_step=launched_at_step,
+                policy_version=policy_version,
+                task_id=task.task_id,
+                domain=getattr(task, "domain", None),
+                stage="rollout",
+                error_type=type(outcome).__name__,
+                error=str(outcome),
+            )
             continue
         _, result = outcome
         score = float(result.judge_score or 0.0)
         overall.append(score)
         domain = getattr(task, "domain", None) or "unknown"
         by_domain[domain].append(score)
+        artifact_event(
+            "evaluations",
+            "evaluation_task_completed",
+            dataset="tau2",
+            launched_at_step=launched_at_step,
+            policy_version=policy_version,
+            task_id=task.task_id,
+            domain=domain,
+            query=getattr(task, "query", ""),
+            response_text=result.text,
+            prompt_tokens=len(result.prompt_token_ids),
+            response_tokens=len(result.response_token_ids),
+            pass1=score,
+        )
 
     def _mean(xs: list[float]) -> float:
         return sum(xs) / len(xs) if xs else 0.0
@@ -336,25 +411,55 @@ async def evaluate_and_log(
     policy_version: int,
     dataset: str = "diligence",
     max_concurrency: int = 8,
-) -> None:
-    """Fire-and-forget wrapper: eval, then wandb.log against the step that *launched* it."""
+) -> dict[str, float] | None:
+    """Evaluate one frozen policy version and persist aggregate results."""
+    started = time.monotonic()
+    artifact_event(
+        "evaluations",
+        "evaluation_started",
+        dataset=dataset,
+        launched_at_step=step,
+        policy_version=policy_version,
+        requested=len(tasks),
+    )
     try:
         if dataset == "tau2" or judge is None:
-            metrics = await evaluate_pass1(engine, tasks, max_concurrency=max_concurrency)
+            metrics = await evaluate_pass1(
+                engine,
+                tasks,
+                max_concurrency=max_concurrency,
+                launched_at_step=step,
+                policy_version=policy_version,
+            )
         else:
             metrics = await evaluate(
-                engine, judge, tasks, max_concurrency=max_concurrency
+                engine,
+                judge,
+                tasks,
+                max_concurrency=max_concurrency,
+                launched_at_step=step,
+                policy_version=policy_version,
             )
         logger.info("EVAL launched at step %d (policy %d): %s", step, policy_version, metrics)
         payload = {f"eval/{k}": v for k, v in metrics.items()}
         payload["eval/launched_at_step"] = float(step)
         payload["eval/policy_version"] = float(policy_version)
+        artifact_event(
+            "evaluations",
+            "evaluation_completed",
+            dataset=dataset,
+            launched_at_step=step,
+            policy_version=policy_version,
+            elapsed_seconds=time.monotonic() - started,
+            metrics=metrics,
+        )
         try:
             import wandb
         except ImportError:
-            return
+            return metrics
         if wandb.run is not None:
             wandb.log(payload)
+        return metrics
     except Exception as exc:
         logger.exception("eval failed (launched at step %d)", step)
         artifact_event(
@@ -366,3 +471,14 @@ async def evaluate_and_log(
             error_type=type(exc).__name__,
             error=str(exc),
         )
+        artifact_event(
+            "evaluations",
+            "evaluation_failed",
+            dataset=dataset,
+            launched_at_step=step,
+            policy_version=policy_version,
+            elapsed_seconds=time.monotonic() - started,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return None

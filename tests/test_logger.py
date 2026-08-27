@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from data.diagnostics import ARTIFACT_FILES, artifact_event
 from train.config import Config, to_yaml
 from train.logger import (
-    evaluate_pass1,
+    evaluate_and_log,
     make_run_name,
     setup_run_logging,
     wandb_run_config,
@@ -51,6 +51,7 @@ def test_setup_writes_args_config_and_train_log(tmp_path: Path):
     assert "console.log" in manifest
     assert "rollouts.jsonl" in manifest
     assert "sandbox.jsonl" in manifest
+    assert "evaluations.jsonl" in manifest
     train_log = ctx.log_dir / "train.log"
     assert train_log.exists()
     assert "unit-run" in train_log.read_text(encoding="utf-8")
@@ -69,7 +70,7 @@ def test_setup_writes_args_config_and_train_log(tmp_path: Path):
     assert payload["data"]["dataset"] == "tau2"
 
 
-def test_pass1_records_one_failed_task_without_aborting_eval():
+def test_pass1_records_one_failed_task_without_aborting_eval(monkeypatch):
     tasks = [
         SimpleNamespace(task_id="ok", domain="retail"),
         SimpleNamespace(task_id="bad", domain="airline"),
@@ -79,10 +80,98 @@ def test_pass1_records_one_failed_task_without_aborting_eval():
         async def generate_tir(self, task):
             if task.task_id == "bad":
                 raise RuntimeError("user simulator unavailable")
-            return SimpleNamespace(judge_score=1.0)
+            return SimpleNamespace(
+                judge_score=1.0,
+                text="successful tau2 transcript",
+                prompt_token_ids=[1, 2],
+                response_token_ids=[3],
+            )
 
-    metrics = asyncio.run(evaluate_pass1(Engine(), tasks, max_concurrency=2))
+    events = []
+    monkeypatch.setattr(
+        "train.logger.artifact_event",
+        lambda channel, event, **fields: events.append((channel, event, fields)),
+    )
+    metrics = asyncio.run(
+        evaluate_and_log(
+            Engine(),
+            None,
+            tasks,
+            step=25,
+            policy_version=25,
+            dataset="tau2",
+            max_concurrency=2,
+        )
+    )
+    assert metrics is not None
     assert metrics["pass1"] == 1.0
     assert metrics["n"] == 1.0
     assert metrics["eval_requested"] == 2.0
     assert metrics["eval_rollout_errors"] == 1.0
+    eval_events = [
+        (event, fields)
+        for channel, event, fields in events
+        if channel == "evaluations"
+    ]
+    assert [event for event, _ in eval_events] == [
+        "evaluation_started",
+        "evaluation_task_completed",
+        "evaluation_task_failed",
+        "evaluation_completed",
+    ]
+    completed = eval_events[1][1]
+    assert completed["launched_at_step"] == 25
+    assert completed["policy_version"] == 25
+    assert completed["task_id"] == "ok"
+    assert completed["pass1"] == 1.0
+    assert completed["response_text"] == "successful tau2 transcript"
+
+
+def test_diligence_eval_records_response_and_judge_score(monkeypatch):
+    task = SimpleNamespace(task_id="d1", domain=None, query="Assess revenue.")
+
+    class Engine:
+        async def generate_tir(self, _task):
+            return SimpleNamespace(
+                text="Revenue increased.",
+                prompt_token_ids=[1],
+                response_token_ids=[2, 3],
+            )
+
+    class Judge:
+        async def score_all(self, _pairs):
+            return [
+                SimpleNamespace(
+                    score=0.75,
+                    raw_score=3.0,
+                    sections={},
+                    error=None,
+                )
+            ]
+
+    events = []
+    monkeypatch.setattr(
+        "train.logger.artifact_event",
+        lambda channel, event, **fields: events.append((channel, event, fields)),
+    )
+    metrics = asyncio.run(
+        evaluate_and_log(
+            Engine(),
+            Judge(),
+            [task],
+            step=50,
+            policy_version=50,
+            dataset="diligence",
+            max_concurrency=1,
+        )
+    )
+
+    assert metrics["judge_score"] == 0.75
+    task_event = next(
+        fields
+        for channel, event, fields in events
+        if (channel, event) == ("evaluations", "evaluation_task_completed")
+    )
+    assert task_event["launched_at_step"] == 50
+    assert task_event["response_text"] == "Revenue increased."
+    assert task_event["score"] == 0.75
