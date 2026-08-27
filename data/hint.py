@@ -84,6 +84,8 @@ def _failure_from_exception(exc: BaseException) -> HintFailure:
         cause = "openrouter_auth"
     elif "(429)" in lower or "429 client error" in lower or "rate limit" in lower:
         cause = "openrouter_rate_limit"
+    elif "finish_reason=length" in lower:
+        cause = "openrouter_length"
     else:
         cause = "openrouter_error"
     return HintFailure(cause=cause, detail=detail)
@@ -97,6 +99,8 @@ async def build_error_hint(
     model: str = "z-ai/glm-5.3-flash",
     timeout: float = 90.0,
     max_retries: int = 5,
+    max_tokens: int = 2048,
+    reasoning_enabled: bool = False,
     user_prompt: str | None = None,
 ) -> str:
     _hint_failure.set(None)
@@ -140,9 +144,10 @@ async def build_error_hint(
             user_prompt,
             model=model,
             api_key=api_key,
-            max_tokens=1024,
+            max_tokens=max_tokens,
             timeout=timeout,
             max_retries=max_retries,
+            reasoning_enabled=reasoning_enabled,
         )
     except Exception as exc:  # noqa: BLE001 -- a hint failure must never break a rollout
         failure = _failure_from_exception(exc)
@@ -224,6 +229,8 @@ async def _one_hint(
             model=config.generator.hint.model,
             timeout=config.generator.hint.timeout,
             max_retries=config.generator.hint.max_retries,
+            max_tokens=config.generator.hint.max_tokens,
+            reasoning_enabled=config.generator.hint.reasoning_enabled,
         )
     return text, _failure_for(text)
 
@@ -249,6 +256,8 @@ async def generate_hint(config: Config, task: Task, response_text: str) -> Hints
                     model=config.generator.hint.model,
                     timeout=config.generator.hint.timeout,
                     max_retries=config.generator.hint.max_retries,
+                    max_tokens=config.generator.hint.max_tokens,
+                    reasoning_enabled=config.generator.hint.reasoning_enabled,
                 )
             failure = _failure_for(text)
             return Hints(

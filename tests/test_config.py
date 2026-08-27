@@ -109,6 +109,8 @@ def test_default_is_proven_tau2_8b_stack():
     assert cfg.generator.engine.disable_custom_all_reduce is True
     assert cfg.generator.hint.prompt == "gold"
     assert cfg.generator.hint.model == "z-ai/glm-5.3-flash"
+    assert cfg.generator.hint.max_tokens == 2048
+    assert cfg.generator.hint.reasoning_enabled is False
     assert cfg.data.user_llm == "openrouter/z-ai/glm-5.3-flash"
     assert cfg.judge.model == "z-ai/glm-5.3-flash"
     assert cfg.logging.log_dir == "/log"
@@ -136,6 +138,11 @@ def test_zero_hint_concurrency_rejected():
 def test_zero_hint_retries_rejected():
     with pytest.raises(ValueError, match="max_retries"):
         Config.from_cli_overrides(["generator.hint.max_retries=0"])
+
+
+def test_zero_hint_max_tokens_rejected():
+    with pytest.raises(ValueError, match="max_tokens"):
+        Config.from_cli_overrides(["generator.hint.max_tokens=0"])
 
 
 # ---- the nesting machinery itself ----

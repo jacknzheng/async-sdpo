@@ -126,6 +126,10 @@ class HintConfig(BaseConfig):
     concurrency: int = 4
     timeout: float = 90.0
     max_retries: int = 5
+    max_tokens: int = 2048
+    # Hints should be short visible text. Reasoning tokens share the output
+    # budget on OpenRouter and caused repeated finish_reason=length empties.
+    reasoning_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.prompt not in HINT_PROMPTS:
@@ -136,6 +140,8 @@ class HintConfig(BaseConfig):
             raise ValueError("generator.hint.concurrency must be >= 1")
         if self.max_retries < 1:
             raise ValueError("generator.hint.max_retries must be >= 1")
+        if self.max_tokens < 1:
+            raise ValueError("generator.hint.max_tokens must be >= 1")
 
 
 @dataclass(frozen=True)

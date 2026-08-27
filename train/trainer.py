@@ -836,7 +836,7 @@ def log_metrics(metrics: dict[str, float], store: TrajectoryStore) -> None:
     logger.info(
         "step %d | loss %.4f | teacher-student gap %+.4f | adv_clip %.1f%% | "
         "ratio_clip lo %.1f%% hi %.1f%% | staleness %.2f (max %d) | grad %.3f | "
-        "lr %.2e | tokens %d | hint_drop %.1f%%",
+        "lr %.2e | tokens %d | hint_drop %.1f%% (%d/%d; length %d)",
         int(combined.get("step", 0)),
         combined.get("loss", 0.0),
         gap,
@@ -849,6 +849,9 @@ def log_metrics(metrics: dict[str, float], store: TrajectoryStore) -> None:
         combined.get("lr", 0.0),
         int(combined.get("tokens", 0)),
         100 * combined.get("store_hint_dropped_percent", 0.0),
+        int(combined.get("store_hint_dropped", 0)),
+        int(combined.get("store_hint_attempted", 0)),
+        int(combined.get("hint_drop_openrouter_length", 0)),
     )
     if abs(gap) < 1e-3:
         logger.warning(

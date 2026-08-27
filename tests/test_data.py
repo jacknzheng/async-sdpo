@@ -298,6 +298,8 @@ def test_hint_request_sends_no_response_format(monkeypatch):
     assert "response_format" not in payload
     assert "provider" not in payload
     assert payload["temperature"] == 0.0
+    assert payload["max_tokens"] == 2048
+    assert payload["reasoning"] == {"enabled": False}
 
 
 def test_api_failure_returns_empty_not_raises(monkeypatch):

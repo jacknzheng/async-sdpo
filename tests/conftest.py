@@ -42,6 +42,8 @@ def make_config(**overrides) -> Config:
         # generator.hint
         "error_hint_prompt": "generator.hint.prompt",
         "error_hint_concurrency": "generator.hint.concurrency",
+        "error_hint_max_tokens": "generator.hint.max_tokens",
+        "error_hint_reasoning_enabled": "generator.hint.reasoning_enabled",
         # judge
         "eval_interval": "judge.eval_interval",
         # data

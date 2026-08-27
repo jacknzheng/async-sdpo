@@ -287,6 +287,13 @@ On diligence (and tau2 `step_hint`), every hint is written **per rollout** by an
 Two rollouts of the same task get different hints. Tau2 `gold` skips the LLM and injects
 Sierra gold / the canonical tool trajectory instead.
 
+A hint request disables model reasoning and reserves 2,048 tokens for visible
+output. Both are independently configurable through
+`generator.hint.reasoning_enabled` and `generator.hint.max_tokens`. Reasoning
+must remain off for GLM hints: OpenRouter counts hidden reasoning against the
+same output budget, which otherwise produces empty `finish_reason=length`
+responses.
+
 A rollout whose hint cannot be generated is **dropped**, not trained with an empty hint:
 an unhinted teacher is identical to the student and would contribute ~zero gradient. Watch
 `store_hint_dropped_percent` and the per-cause `hint_drop_*` counters. The percentage is

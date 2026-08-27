@@ -109,6 +109,7 @@ async def chat_completion(
     max_tokens: int = 16000,
     timeout: float = 120.0,
     max_retries: int = 3,
+    reasoning_enabled: bool = True,
     response_schema: dict | None = None,
     parse: Callable[[str], object] | None = None,
 ):
@@ -151,6 +152,7 @@ async def chat_completion(
             user_prompt,
             model=model,
             max_tokens=max_tokens,
+            reasoning_enabled=reasoning_enabled,
             response_schema=response_schema,
             mode=mode,
         )
@@ -189,6 +191,7 @@ def _chat_payload(
     *,
     model: str,
     max_tokens: int,
+    reasoning_enabled: bool,
     response_schema: dict | None,
     mode: str | None,
 ) -> dict:
@@ -205,7 +208,7 @@ def _chat_payload(
         # metric, and for hints it keeps the same rollout from yielding a different teacher
         # on a rerun.
         "temperature": 0.0,
-        "reasoning": {"enabled": True},
+        "reasoning": {"enabled": reasoning_enabled},
     }
     if mode == "json_schema":
         payload["response_format"] = {

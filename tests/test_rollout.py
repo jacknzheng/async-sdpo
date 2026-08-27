@@ -305,6 +305,7 @@ def test_hint_failure_returns_empty_not_raises(monkeypatch):
         ("openrouter rejected the request (402): insufficient credits", "openrouter_credit"),
         ("openrouter auth failed (401): invalid key", "openrouter_auth"),
         ("429 Client Error: Too Many Requests", "openrouter_rate_limit"),
+        ("no content returned (finish_reason=length)", "openrouter_length"),
         ("provider unavailable", "openrouter_error"),
     ],
 )
@@ -347,6 +348,8 @@ def test_hint_receives_the_configured_prompt_variant(monkeypatch):
     assert seen["query"] == "Assess the funding base."
     assert seen["model"] == "z-ai/glm-5.3-flash"
     assert seen["max_retries"] == 5
+    assert seen["max_tokens"] == 2048
+    assert seen["reasoning_enabled"] is False
 
 
 def test_hint_concurrency_is_bounded(monkeypatch):
