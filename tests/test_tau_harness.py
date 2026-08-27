@@ -323,10 +323,30 @@ def test_sandbox_probe_ok(monkeypatch):
     monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
     monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: f"/usr/bin/{_name}")
 
-    class _Proc:
-        returncode = 0
-        stdout = "bwrap-ok\n"
-        stderr = ""
+    def run(command, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout="srt-ok\n" if command[0] == "srt" else "bwrap-ok\n",
+            stderr="",
+        )
 
-    monkeypatch.setattr("data.tau_harness.subprocess.run", lambda *a, **k: _Proc())
+    monkeypatch.setattr("data.tau_harness.subprocess.run", run)
     assert_sandbox_ready(["banking_knowledge"])
+
+
+def test_sandbox_probe_rejects_broken_srt_runtime(monkeypatch):
+    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
+    monkeypatch.setattr("data.tau_harness.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def run(command, **kwargs):
+        if command[0] == "srt":
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="sandbox runtime failed to launch bwrap",
+            )
+        return SimpleNamespace(returncode=0, stdout="bwrap-ok\n", stderr="")
+
+    monkeypatch.setattr("data.tau_harness.subprocess.run", run)
+    with pytest.raises(SandboxNamespaceError, match="srt end-to-end probe failed"):
+        assert_sandbox_ready(["banking_knowledge"])

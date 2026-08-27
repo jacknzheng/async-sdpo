@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 # huggingface_hub snapshots this at import time. Anonymous or cold model pulls on
@@ -239,24 +240,67 @@ async def sync_weights(
     for. We create the receive task, yield once so it dispatches, run the (blocking,
     synchronous) send in a thread so the event loop stays free, then join.
     """
+    started = time.monotonic()
+    bucket_index = -1
+    stage = "pause"
     if rank == 0:
-        await engine.pause_for_update()
-
-    for bucket in trainer.weight_buckets():
+        artifact_event(
+            "vllm",
+            "weight_sync_started",
+            new_version=new_version,
+            timeout_seconds=trainer.config.generator.engine.weight_sync_timeout_s,
+        )
+    try:
         if rank == 0:
-            receive = asyncio.create_task(
-                engine.receive_weight_bucket(bucket.names, bucket.dtype_names, bucket.shapes)
-            )
-            await asyncio.sleep(0)  # let the receive RPC dispatch before we send
-            await asyncio.to_thread(trainer.send_weight_bucket, bucket)
-            await asyncio.wait_for(
-                receive, timeout=trainer.config.generator.engine.weight_sync_timeout_s
-            )
+            await engine.pause_for_update()
 
+        stage = "bucket_transfer"
+        for bucket_index, bucket in enumerate(trainer.weight_buckets()):
+            if rank == 0:
+                receive = asyncio.create_task(
+                    engine.receive_weight_bucket(
+                        bucket.names, bucket.dtype_names, bucket.shapes
+                    )
+                )
+                await asyncio.sleep(0)  # let the receive RPC dispatch before we send
+                await asyncio.to_thread(trainer.send_weight_bucket, bucket)
+                await asyncio.wait_for(
+                    receive,
+                    timeout=trainer.config.generator.engine.weight_sync_timeout_s,
+                )
+
+        stage = "finish"
+        if rank == 0:
+            await engine.finish_update(new_version)
+            await store.set_policy_version(new_version)
+            await store.prune_stale(staleness_manager=trainer.staleness_manager)
+    except Exception as exc:
+        if rank == 0:
+            logger.exception(
+                "weight sync failed at stage %s, bucket %d, version %d",
+                stage,
+                bucket_index,
+                new_version,
+            )
+            artifact_event(
+                "vllm",
+                "weight_sync_failed",
+                new_version=new_version,
+                stage=stage,
+                bucket_index=bucket_index,
+                elapsed_seconds=time.monotonic() - started,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        raise
     if rank == 0:
-        await engine.finish_update(new_version)
-        await store.set_policy_version(new_version)
-        await store.prune_stale(staleness_manager=trainer.staleness_manager)
+        artifact_event(
+            "vllm",
+            "weight_sync_succeeded",
+            new_version=new_version,
+            bucket_count=bucket_index + 1,
+            elapsed_seconds=time.monotonic() - started,
+        )
 
 
 async def generate_trajectory(

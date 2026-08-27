@@ -39,6 +39,7 @@ _BWRAP_PROBE = (
     "/bin/echo",
     "bwrap-ok",
 )
+_SRT_PROBE = ("srt", "-c", "echo srt-ok")
 SANDBOX_NAMESPACE_HINT = """
 bwrap cannot create a Linux namespace on this host
 (typically: Creating new namespace failed: Operation not permitted).
@@ -91,7 +92,7 @@ def assert_sandbox_ready(domains: list[str]) -> None:
         domains=domains,
         platform=sys.platform,
         binaries=resolved,
-        probe=list(_BWRAP_PROBE),
+        probes=[list(_BWRAP_PROBE), list(_SRT_PROBE)],
     )
     if missing:
         artifact_event(
@@ -120,28 +121,65 @@ def assert_sandbox_ready(domains: list[str]) -> None:
         raise SandboxNamespaceError(
             f"bwrap namespace probe could not run: {exc}\n\n{SANDBOX_NAMESPACE_HINT}"
         ) from exc
-    if proc.returncode == 0:
-        logger.info("tau2 sandbox: bwrap namespace probe ok")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
         artifact_event(
             "sandbox",
-            "sandbox_preflight_succeeded",
+            "sandbox_preflight_failed",
+            cause="namespace_probe_failed",
             returncode=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
         )
-        return
-    err = (proc.stderr or proc.stdout or "").strip()
+        raise SandboxNamespaceError(
+            f"bwrap namespace probe failed (exit {proc.returncode}): {err}\n\n"
+            f"{SANDBOX_NAMESPACE_HINT}"
+        )
+    logger.info("tau2 sandbox: bwrap namespace probe ok")
+
+    try:
+        srt_proc = subprocess.run(
+            _SRT_PROBE, capture_output=True, text=True, timeout=15
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        artifact_event(
+            "sandbox",
+            "sandbox_preflight_failed",
+            cause="srt_probe_exception",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise SandboxNamespaceError(
+            f"srt end-to-end probe could not run: {exc}\n\n{SANDBOX_NAMESPACE_HINT}"
+        ) from exc
+    if srt_proc.returncode != 0 or "srt-ok" not in (srt_proc.stdout or ""):
+        err = (srt_proc.stderr or srt_proc.stdout or "").strip()
+        artifact_event(
+            "sandbox",
+            "sandbox_preflight_failed",
+            cause="srt_probe_failed",
+            returncode=srt_proc.returncode,
+            stdout=srt_proc.stdout,
+            stderr=srt_proc.stderr,
+        )
+        raise SandboxNamespaceError(
+            f"srt end-to-end probe failed (exit {srt_proc.returncode}): {err}\n\n"
+            f"{SANDBOX_NAMESPACE_HINT}"
+        )
+    logger.info("tau2 sandbox: srt end-to-end probe ok")
     artifact_event(
         "sandbox",
-        "sandbox_preflight_failed",
-        cause="namespace_probe_failed",
-        returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-    )
-    raise SandboxNamespaceError(
-        f"bwrap namespace probe failed (exit {proc.returncode}): {err}\n\n"
-        f"{SANDBOX_NAMESPACE_HINT}"
+        "sandbox_preflight_succeeded",
+        bwrap={
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        },
+        srt={
+            "returncode": srt_proc.returncode,
+            "stdout": srt_proc.stdout,
+            "stderr": srt_proc.stderr,
+        },
     )
 
 DEFAULT_GREETING = "Hi! How can I help you today?"
@@ -330,7 +368,14 @@ def configure_embeddings_cache(cache_dir: str | None = None) -> None:
 def openai_tool_schemas(env) -> list[dict]:
     try:
         return [t.openai_schema for t in env.get_tools()]
-    except Exception:
+    except Exception as exc:
+        logger.exception("tau2 tool schema discovery failed")
+        artifact_event(
+            "sandbox",
+            "tau2_tool_schema_discovery_failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         return []
 
 
