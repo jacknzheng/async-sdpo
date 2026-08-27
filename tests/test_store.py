@@ -185,8 +185,11 @@ def test_hint_drop_percent_uses_all_attempts_and_tracks_cause():
         store = TrajectoryStore(capacity=20)
         for i in range(10):
             await store.add(_traj(task_id=str(i)))
-        for _ in range(20):
+        for _ in range(17):
             store.stats.count_hint_drop("openrouter_error")
+        store.stats.count_hint_drop("openrouter_credit")
+        store.stats.count_hint_drop("openrouter_auth")
+        store.stats.count_hint_drop("openrouter_rate_limit")
         return store.metrics()
 
     metrics = asyncio.run(run())
@@ -194,4 +197,7 @@ def test_hint_drop_percent_uses_all_attempts_and_tracks_cause():
     assert metrics["store_hint_ok"] == 10.0
     assert metrics["store_hint_dropped"] == 20.0
     assert metrics["store_hint_dropped_percent"] == pytest.approx(2 / 3)
-    assert metrics["hint_drop_openrouter_error"] == 20.0
+    assert metrics["hint_drop_openrouter_error"] == 17.0
+    assert metrics["hint_drop_openrouter_credit"] == 1.0
+    assert metrics["hint_drop_openrouter_auth"] == 1.0
+    assert metrics["hint_drop_openrouter_rate_limit"] == 1.0

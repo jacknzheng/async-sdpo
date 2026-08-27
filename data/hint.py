@@ -12,8 +12,14 @@ from reward.judge import chat_completion
 
 logger = logging.getLogger(__name__)
 
-_hint_cause: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "hint_cause", default=""
+@dataclass(frozen=True)
+class HintFailure:
+    cause: str
+    detail: str
+
+
+_hint_failure: contextvars.ContextVar[HintFailure | None] = contextvars.ContextVar(
+    "hint_failure", default=None
 )
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -31,6 +37,7 @@ class Hints:
     free: str = ""
     bearing: str = ""
     cause: str = ""
+    detail: str = ""
 
     def ok(self, mode: str) -> bool:
         if mode == "mixture":
@@ -56,6 +63,31 @@ def _format_rubric(sections: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _failure_from_exception(exc: BaseException) -> HintFailure:
+    """Classify an OpenRouter failure and retain a bounded, one-line diagnostic."""
+    detail = " ".join(f"{type(exc).__name__}: {exc}".split())[:800]
+    lower = detail.lower()
+    if (
+        isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+        or "timeout" in lower
+        or "timed out" in lower
+    ):
+        cause = "timeout"
+    elif (
+        "insufficient credit" in lower
+        or "insufficient credits" in lower
+        or "(402)" in lower
+    ):
+        cause = "openrouter_credit"
+    elif "auth failed (401)" in lower or "auth failed (403)" in lower:
+        cause = "openrouter_auth"
+    elif "(429)" in lower or "429 client error" in lower or "rate limit" in lower:
+        cause = "openrouter_rate_limit"
+    else:
+        cause = "openrouter_error"
+    return HintFailure(cause=cause, detail=detail)
+
+
 async def build_error_hint(
     query: str = "",
     sections: list[dict] | None = None,
@@ -66,7 +98,7 @@ async def build_error_hint(
     max_retries: int = 5,
     user_prompt: str | None = None,
 ) -> str:
-    _hint_cause.set("")
+    _hint_failure.set(None)
     if prompt_variant not in ERROR_HINT_PROMPTS:
         raise ValueError(
             f"unknown hint prompt {prompt_variant!r}; choose from {sorted(ERROR_HINT_PROMPTS)}"
@@ -74,7 +106,12 @@ async def build_error_hint(
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        _hint_cause.set("openrouter_error")
+        _hint_failure.set(
+            HintFailure(
+                cause="openrouter_auth",
+                detail="OPENROUTER_API_KEY is unset",
+            )
+        )
         logger.warning("OPENROUTER_API_KEY is unset; cannot generate %s hint", prompt_variant)
         return ""
 
@@ -96,27 +133,24 @@ async def build_error_hint(
             max_retries=max_retries,
         )
     except Exception as exc:  # noqa: BLE001 -- a hint failure must never break a rollout
-        text = str(exc).lower()
-        cause = (
-            "timeout"
-            if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
-            or "timeout" in text
-            or "timed out" in text
-            else "openrouter_error"
-        )
-        _hint_cause.set(cause)
+        failure = _failure_from_exception(exc)
+        _hint_failure.set(failure)
         logger.warning(
-            "error-hint generation failed (variant=%s, cause=%s): %s: %s",
+            "error-hint generation failed (variant=%s, cause=%s, detail=%s)",
             prompt_variant,
-            cause,
-            type(exc).__name__,
-            exc,
+            failure.cause,
+            failure.detail,
         )
         return ""
 
     generated = generated.strip()
     if not generated:
-        _hint_cause.set("empty")
+        _hint_failure.set(
+            HintFailure(
+                cause="empty",
+                detail="OpenRouter returned empty hint content",
+            )
+        )
         return ""
     if prompt_variant == "step_hint":
         return generated
@@ -133,13 +167,18 @@ def _hint_sem(concurrency: int) -> asyncio.Semaphore:
     return _HINT_SEM
 
 
-def _cause_for(text: str) -> str:
-    return "" if text else (_hint_cause.get() or "empty")
+def _failure_for(text: str) -> HintFailure | None:
+    if text:
+        return None
+    return _hint_failure.get() or HintFailure(
+        cause="empty",
+        detail="hint generator returned no content",
+    )
 
 
 async def _one_hint(
     config: Config, task: Task, response_text: str, variant: str
-) -> tuple[str, str]:
+) -> tuple[str, HintFailure | None]:
     async with _hint_sem(config.generator.hint.concurrency):
         text = await build_error_hint(
             query=task.query,
@@ -150,7 +189,7 @@ async def _one_hint(
             timeout=config.generator.hint.timeout,
             max_retries=config.generator.hint.max_retries,
         )
-    return text, _cause_for(text)
+    return text, _failure_for(text)
 
 
 async def generate_hint(config: Config, task: Task, response_text: str) -> Hints:
@@ -175,24 +214,40 @@ async def generate_hint(config: Config, task: Task, response_text: str) -> Hints
                     timeout=config.generator.hint.timeout,
                     max_retries=config.generator.hint.max_retries,
                 )
-            return Hints(free=text, cause=_cause_for(text))
+            failure = _failure_for(text)
+            return Hints(
+                free=text,
+                cause=failure.cause if failure else "",
+                detail=failure.detail if failure else "",
+            )
         if mode == "mixture":
-            (free, free_cause), (bearing, bearing_cause) = await asyncio.gather(
+            (free, free_failure), (bearing, bearing_failure) = await asyncio.gather(
                 _one_hint(config, task, response_text, "answer_free"),
                 _one_hint(config, task, response_text, "answer_bearing"),
             )
+            failure = free_failure or bearing_failure
             return Hints(
                 free=free,
                 bearing=bearing,
-                cause=free_cause or bearing_cause,
+                cause=failure.cause if failure else "",
+                detail=failure.detail if failure else "",
             )
         if mode == "answer_bearing":
-            text, cause = await _one_hint(
+            text, failure = await _one_hint(
                 config, task, response_text, "answer_bearing"
             )
-            return Hints(bearing=text, cause=cause)
-        text, cause = await _one_hint(config, task, response_text, "answer_free")
-        return Hints(free=text, cause=cause)
-    except Exception:
+            return Hints(
+                bearing=text,
+                cause=failure.cause if failure else "",
+                detail=failure.detail if failure else "",
+            )
+        text, failure = await _one_hint(config, task, response_text, "answer_free")
+        return Hints(
+            free=text,
+            cause=failure.cause if failure else "",
+            detail=failure.detail if failure else "",
+        )
+    except Exception as exc:
         logger.exception("error-hint failed for task %s", task.task_id)
-        return Hints(cause="other")
+        failure = _failure_from_exception(exc)
+        return Hints(cause="other", detail=failure.detail)

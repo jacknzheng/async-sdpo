@@ -13,6 +13,9 @@ class StoreStats:
     evicted_stale: int = 0
     evicted_capacity: int = 0
     hint_dropped: int = 0
+    hint_drop_openrouter_credit: int = 0
+    hint_drop_openrouter_auth: int = 0
+    hint_drop_openrouter_rate_limit: int = 0
     hint_drop_openrouter_error: int = 0
     hint_drop_timeout: int = 0
     hint_drop_empty: int = 0
@@ -47,6 +50,11 @@ class StoreStats:
             "store_hint_attempted": float(hint_attempts),
             "store_hint_ok": float(self.added),
             "store_hint_dropped": float(self.hint_dropped),
+            "hint_drop_openrouter_credit": float(self.hint_drop_openrouter_credit),
+            "hint_drop_openrouter_auth": float(self.hint_drop_openrouter_auth),
+            "hint_drop_openrouter_rate_limit": float(
+                self.hint_drop_openrouter_rate_limit
+            ),
             "hint_drop_openrouter_error": float(self.hint_drop_openrouter_error),
             "hint_drop_timeout": float(self.hint_drop_timeout),
             "hint_drop_empty": float(self.hint_drop_empty),

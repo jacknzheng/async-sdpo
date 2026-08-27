@@ -295,6 +295,36 @@ def test_hint_failure_returns_empty_not_raises(monkeypatch):
     )
     assert hints.free == ""
     assert not hints.ok("answer_free")
+    assert hints.cause == "other"
+    assert hints.detail == "RuntimeError: api down"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_cause"),
+    [
+        ("openrouter rejected the request (402): insufficient credits", "openrouter_credit"),
+        ("openrouter auth failed (401): invalid key", "openrouter_auth"),
+        ("429 Client Error: Too Many Requests", "openrouter_rate_limit"),
+        ("provider unavailable", "openrouter_error"),
+    ],
+)
+def test_hint_failure_logs_actionable_openrouter_cause(
+    monkeypatch, message, expected_cause
+):
+    from conftest import make_config
+    from data.hint import generate_hint
+
+    async def fail_chat_completion(*args, **kwargs):
+        raise RuntimeError(message)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr("data.hint.chat_completion", fail_chat_completion)
+    hints = asyncio.run(
+        generate_hint(make_config(error_hint_prompt="answer_free"), _task(), "draft")
+    )
+
+    assert hints.cause == expected_cause
+    assert message in hints.detail
 
 
 def test_hint_receives_the_configured_prompt_variant(monkeypatch):

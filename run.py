@@ -282,9 +282,11 @@ async def generate_trajectory(
         cause = hints.cause or "other"
         store.stats.count_hint_drop(cause)
         logger.warning(
-            "dropping rollout for task %s: no hint could be generated (cause=%s)",
+            "dropping rollout for task %s: no hint could be generated "
+            "(cause=%s, detail=%s)",
             task.task_id,
             cause,
+            hints.detail or "unavailable",
         )
         await staleness_manager.on_rollout_rejected()
         return
