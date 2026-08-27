@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 import requests
+
+from data.diagnostics import artifact_event
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +101,14 @@ def parallel_search(
     """Call Parallel Search. Returns (formatted excerpts, session_id)."""
     key = api_key if api_key is not None else os.environ.get("PARALLEL_API_KEY")
     if not key:
+        artifact_event(
+            "api_failures",
+            "api_call_failed",
+            provider="parallel",
+            operation="search",
+            cause="missing_api_key",
+            error="PARALLEL_API_KEY is not set",
+        )
         raise RuntimeError(
             "PARALLEL_API_KEY is not set; diligence TIR needs Parallel Search "
             "(https://docs.parallel.ai/search/search-quickstart)"
@@ -117,6 +128,7 @@ def parallel_search(
     if client_model:
         body["client_model"] = client_model
 
+    started = time.monotonic()
     try:
         response = requests.post(
             SEARCH_URL,
@@ -125,17 +137,89 @@ def parallel_search(
             timeout=timeout,
         )
     except requests.RequestException as exc:
-        logger.warning("parallel search request failed: %s", exc)
+        elapsed = time.monotonic() - started
+        logger.warning(
+            "parallel search request failed after %.3fs "
+            "(mode=%s, queries=%r, session=%s): %s: %s",
+            elapsed,
+            mode,
+            queries,
+            session_id,
+            type(exc).__name__,
+            exc,
+        )
+        artifact_event(
+            "api_failures",
+            "api_call_failed",
+            provider="parallel",
+            operation="search",
+            cause="transport_error",
+            mode=mode,
+            queries=queries,
+            objective=objective,
+            session_id=session_id,
+            elapsed_seconds=elapsed,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         return f"web_search error: {exc}", session_id
 
     if response.status_code >= 400:
-        snippet = (response.text or "")[:400]
-        logger.warning("parallel search HTTP %s: %s", response.status_code, snippet)
+        elapsed = time.monotonic() - started
+        response_text = response.text or ""
+        snippet = response_text[:400]
+        logger.warning(
+            "parallel search HTTP %s after %.3fs "
+            "(mode=%s, queries=%r, session=%s): %s",
+            response.status_code,
+            elapsed,
+            mode,
+            queries,
+            session_id,
+            snippet,
+        )
+        artifact_event(
+            "api_failures",
+            "api_call_failed",
+            provider="parallel",
+            operation="search",
+            cause="http_error",
+            status_code=response.status_code,
+            mode=mode,
+            queries=queries,
+            objective=objective,
+            session_id=session_id,
+            elapsed_seconds=elapsed,
+            response=response_text[:4000],
+        )
         return f"web_search error: HTTP {response.status_code}: {snippet}", session_id
 
     try:
         payload = response.json()
-    except ValueError:
+    except ValueError as exc:
+        elapsed = time.monotonic() - started
+        logger.warning(
+            "parallel search returned non-JSON HTTP %s after %.3fs: %s",
+            response.status_code,
+            elapsed,
+            (response.text or "")[:400],
+        )
+        artifact_event(
+            "api_failures",
+            "api_call_failed",
+            provider="parallel",
+            operation="search",
+            cause="invalid_json",
+            status_code=response.status_code,
+            mode=mode,
+            queries=queries,
+            objective=objective,
+            session_id=session_id,
+            elapsed_seconds=elapsed,
+            response=(response.text or "")[:4000],
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         return "web_search error: response was not JSON", session_id
 
     echoed = payload.get("session_id") or session_id

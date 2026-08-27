@@ -297,6 +297,7 @@ def test_sandbox_probe_missing_binaries(monkeypatch):
 def test_sandbox_probe_namespace_denied(monkeypatch):
     monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
     monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: f"/usr/bin/{_name}")
+    events = []
 
     class _Proc:
         returncode = 1
@@ -304,8 +305,18 @@ def test_sandbox_probe_namespace_denied(monkeypatch):
         stderr = "bwrap: Creating new namespace failed: Operation not permitted"
 
     monkeypatch.setattr("data.tau_harness.subprocess.run", lambda *a, **k: _Proc())
+    monkeypatch.setattr(
+        "data.tau_harness.artifact_event",
+        lambda channel, event, **fields: events.append((channel, event, fields)),
+    )
     with pytest.raises(SandboxNamespaceError, match="container policy"):
         assert_sandbox_ready(["banking_knowledge"])
+    assert [event for _, event, _ in events] == [
+        "sandbox_preflight_started",
+        "sandbox_preflight_failed",
+    ]
+    assert events[-1][2]["cause"] == "namespace_probe_failed"
+    assert "Operation not permitted" in events[-1][2]["stderr"]
 
 
 def test_sandbox_probe_ok(monkeypatch):

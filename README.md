@@ -148,9 +148,15 @@ bash scripts/run_diligencebench.sh mixture
 ```
 
 Dotted overrides after the mode, e.g. `bash scripts/run_taubench.sh gold trainer.total_steps=200`.
-Logs land in `/log/<run_name>/` (`train.log`, `console.log`, `args.txt`, `config.yaml`);
-if `/log` is not writable the scripts fall back to `./log`. Checkpoints go to
-`runs/sdpo-tau2/` or `runs/sdpo-diligence/`. Wandb projects: `sdpo-tau2` / `sdpo-diligence`.
+Logs land in `/log/<run_name>/`; if `/log` is not writable the scripts fall
+back to `./log`. `ARTIFACTS.txt` describes every file: `console.log` includes
+vLLM subprocess output, `train.log` and `rankN.log` contain Python logs, and
+the structured `api_failures.jsonl`, `rollouts.jsonl`, `sandbox.jsonl`,
+`training.jsonl`, and `vllm.jsonl` streams retain failure context, complete
+episodes, tool activity, per-step metrics, and generation lifecycles.
+`scripts/setup_tau2_sandbox.sh` also writes a timestamped
+`tau2-sandbox-setup-*.log`. Checkpoints go to `runs/sdpo-tau2/` or
+`runs/sdpo-diligence/`. Wandb projects: `sdpo-tau2` / `sdpo-diligence`.
 
 The real run is `torchrun --nproc-per-node=4` (one process per trainer GPU). Rank 0 owns
 rollout, the store, eval, and wandb; ranks 1–3 only train. `--smoke` and `--baseline` are

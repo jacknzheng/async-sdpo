@@ -49,6 +49,7 @@ import requests
 from rubric import EvaluationReport, OneShotOutput
 from rubric.autograders import PerCriterionOneShotGrader
 
+from data.diagnostics import artifact_event
 from data.dataset import Task
 
 logger = logging.getLogger(__name__)
@@ -244,13 +245,45 @@ async def _post_chat_completion(
 
     last_error: Exception | None = None
     for attempt in range(max_retries):
+        response: requests.Response | None = None
         try:
-            content = _extract_content(await asyncio.to_thread(post))
+            response = await asyncio.to_thread(post)
+            content = _extract_content(response)
             return parse(content) if parse is not None else content
-        except TerminalJudgeError:
+        except TerminalJudgeError as exc:
+            artifact_event(
+                "api_failures",
+                "api_call_failed",
+                provider="openrouter",
+                operation="chat_completion",
+                model=payload.get("model"),
+                response_mode=(payload.get("response_format") or {}).get("type", "text"),
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                terminal=True,
+                status_code=getattr(response, "status_code", None),
+                response=(getattr(response, "text", "") or "")[:4000],
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             raise
         except Exception as exc:  # noqa: BLE001 -- retried below, re-raised if terminal
             last_error = exc
+            artifact_event(
+                "api_failures",
+                "api_call_failed",
+                provider="openrouter",
+                operation="chat_completion",
+                model=payload.get("model"),
+                response_mode=(payload.get("response_format") or {}).get("type", "text"),
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                terminal=False,
+                status_code=getattr(response, "status_code", None),
+                response=(getattr(response, "text", "") or "")[:4000],
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             if attempt < max_retries - 1:
                 await asyncio.sleep(2.0**attempt)
     raise RuntimeError(f"openrouter call failed after {max_retries} attempts: {last_error}")
@@ -339,6 +372,7 @@ class RubricJudge:
         max_retries: int = 3,
         timeout: float = 120.0,
     ) -> None:
+        self.model = model
         self.grader = PerCriterionOneShotGrader(
             generate_fn=OpenRouterOneShotGenerator(
                 model=model, max_retries=max_retries, timeout=timeout
@@ -366,6 +400,18 @@ class RubricJudge:
                     task.task_id,
                     type(exc).__name__,
                     exc,
+                )
+                artifact_event(
+                    "api_failures",
+                    "judge_failed",
+                    provider="openrouter",
+                    operation="rubric_judge",
+                    task_id=task.task_id,
+                    model=getattr(self, "model", "unknown"),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    query=task.query,
+                    answer=answer,
                 )
                 return JudgeResult(task_id=task.task_id, score=0.0, raw_score=0.0, error=str(exc))
 

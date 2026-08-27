@@ -15,11 +15,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from data.dataset import Task
+from data.diagnostics import artifact_event
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +66,41 @@ def assert_sandbox_ready(domains: list[str]) -> None:
     Skip when banking is not in `domains`, and on macOS (sandbox-exec, not bwrap).
     """
     if "banking_knowledge" not in domains:
+        artifact_event(
+            "sandbox",
+            "sandbox_preflight_skipped",
+            domains=domains,
+            reason="banking_knowledge_not_requested",
+        )
         return
     if sys.platform == "darwin":
         logger.info("tau2 sandbox: macOS uses sandbox-exec; skipping Linux namespace probe")
+        artifact_event(
+            "sandbox",
+            "sandbox_preflight_skipped",
+            domains=domains,
+            platform=sys.platform,
+            reason="macos_uses_sandbox_exec",
+        )
         return
-    missing = [name for name in _SANDBOX_BINS if shutil.which(name) is None]
+    resolved = {name: shutil.which(name) for name in _SANDBOX_BINS}
+    missing = [name for name, path in resolved.items() if path is None]
+    artifact_event(
+        "sandbox",
+        "sandbox_preflight_started",
+        domains=domains,
+        platform=sys.platform,
+        binaries=resolved,
+        probe=list(_BWRAP_PROBE),
+    )
     if missing:
+        artifact_event(
+            "sandbox",
+            "sandbox_preflight_failed",
+            cause="missing_binaries",
+            missing=missing,
+            binaries=resolved,
+        )
         raise SandboxNamespaceError(
             "tau2 banking sandbox binaries missing from PATH: "
             f"{missing}. Run: bash scripts/setup_tau2_sandbox.sh"
@@ -79,13 +110,35 @@ def assert_sandbox_ready(domains: list[str]) -> None:
             _BWRAP_PROBE, capture_output=True, text=True, timeout=10
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        artifact_event(
+            "sandbox",
+            "sandbox_preflight_failed",
+            cause="probe_exception",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         raise SandboxNamespaceError(
             f"bwrap namespace probe could not run: {exc}\n\n{SANDBOX_NAMESPACE_HINT}"
         ) from exc
     if proc.returncode == 0:
         logger.info("tau2 sandbox: bwrap namespace probe ok")
+        artifact_event(
+            "sandbox",
+            "sandbox_preflight_succeeded",
+            returncode=proc.returncode,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+        )
         return
     err = (proc.stderr or proc.stdout or "").strip()
+    artifact_event(
+        "sandbox",
+        "sandbox_preflight_failed",
+        cause="namespace_probe_failed",
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
     raise SandboxNamespaceError(
         f"bwrap namespace probe failed (exit {proc.returncode}): {err}\n\n"
         f"{SANDBOX_NAMESPACE_HINT}"
@@ -150,11 +203,30 @@ def parse_tool_calls(text: str) -> list[ToolCallSpec]:
         raw = match.group(1).strip()
         try:
             payload = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.debug("skipping unparseable tool_call block: %s", raw[:200])
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "skipping unparseable tool_call block: %s: %s",
+                exc,
+                raw[:500],
+            )
+            artifact_event(
+                "rollouts",
+                "tool_call_parse_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                raw=raw,
+            )
             continue
         name = payload.get("name") or payload.get("function")
         if not name:
+            logger.warning("skipping tool_call with no function name: %s", raw[:500])
+            artifact_event(
+                "rollouts",
+                "tool_call_parse_failed",
+                error_type="MissingFunctionName",
+                error="tool call contained no name or function",
+                raw=raw,
+            )
             continue
         args = payload.get("arguments") or payload.get("parameters") or {}
         if isinstance(args, str):
@@ -312,18 +384,57 @@ def make_env(task: Task, retrieval: str = "alltools-qwen"):
 
     if task.domain is None or task.tau2_task is None:
         raise ValueError(f"{task.task_id} is not a tau2 task")
-    ctor = registry.get_env_constructor(task.domain)
-    env = ctor(**env_kwargs_for(task, retrieval))
-    tau = task.tau2_task
-    init = getattr(tau, "initial_state", None)
-    env.set_state(
-        initialization_data=getattr(init, "initialization_data", None) if init else None,
-        initialization_actions=(
-            getattr(init, "initialization_actions", None) if init else None
-        ),
-        message_history=(
-            list(getattr(init, "message_history", None) or []) if init else []
-        ),
+    started = time.monotonic()
+    kwargs = env_kwargs_for(task, retrieval)
+    artifact_event(
+        "sandbox",
+        "tau2_environment_build_started",
+        task_id=task.task_id,
+        domain=task.domain,
+        retrieval=retrieval,
+        env_kwargs=kwargs,
+    )
+    try:
+        ctor = registry.get_env_constructor(task.domain)
+        env = ctor(**kwargs)
+        tau = task.tau2_task
+        init = getattr(tau, "initial_state", None)
+        env.set_state(
+            initialization_data=getattr(init, "initialization_data", None)
+            if init
+            else None,
+            initialization_actions=(
+                getattr(init, "initialization_actions", None) if init else None
+            ),
+            message_history=(
+                list(getattr(init, "message_history", None) or []) if init else []
+            ),
+        )
+    except Exception as exc:
+        logger.exception(
+            "tau2 environment build failed for task %s (%s)",
+            task.task_id,
+            task.domain,
+        )
+        artifact_event(
+            "sandbox",
+            "tau2_environment_build_failed",
+            task_id=task.task_id,
+            domain=task.domain,
+            retrieval=retrieval,
+            elapsed_seconds=time.monotonic() - started,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
+    artifact_event(
+        "sandbox",
+        "tau2_environment_build_succeeded",
+        task_id=task.task_id,
+        domain=task.domain,
+        retrieval=retrieval,
+        elapsed_seconds=time.monotonic() - started,
+        tool_count=len(openai_tool_schemas(env)),
     )
     return env
 
@@ -554,7 +665,29 @@ async def run_tau2_episode(
         def _call():
             return user.generate_next_message(incoming, user_state)
 
-        user_msg, _ = await asyncio.to_thread(_call)
+        started = time.monotonic()
+        try:
+            user_msg, _ = await asyncio.to_thread(_call)
+        except Exception as exc:
+            logger.exception(
+                "tau2 user simulator failed for task %s (%s)",
+                task.task_id,
+                task.domain,
+            )
+            artifact_event(
+                "api_failures",
+                "tau2_user_simulator_failed",
+                provider="openrouter",
+                operation="tau2_user_simulator",
+                task_id=task.task_id,
+                domain=task.domain,
+                model=user_llm,
+                elapsed_seconds=time.monotonic() - started,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                incoming_agent_text=agent_text,
+            )
+            raise
         done = UserSimulator.is_stop(user_msg)
         return user_msg.content or "", done
 
@@ -563,29 +696,84 @@ async def run_tau2_episode(
     # re-feed it. `_user_reply` appends each new assistant text.
 
     def _execute(tc: ToolCallSpec) -> str:
-        result = env.get_response(
-            ToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
+        started = time.monotonic()
+        artifact_event(
+            "sandbox",
+            "tau2_tool_call_started",
+            task_id=task.task_id,
+            domain=task.domain,
+            tool_call_id=tc.id,
+            tool=tc.name,
+            arguments=tc.arguments,
         )
-        return result.content or ""
+        try:
+            result = env.get_response(
+                ToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
+            )
+        except Exception as exc:
+            logger.exception(
+                "tau2 tool call failed for task %s (%s): %s",
+                task.task_id,
+                task.domain,
+                tc.name,
+            )
+            artifact_event(
+                "sandbox",
+                "tau2_tool_call_failed",
+                task_id=task.task_id,
+                domain=task.domain,
+                tool_call_id=tc.id,
+                tool=tc.name,
+                arguments=tc.arguments,
+                elapsed_seconds=time.monotonic() - started,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        content = result.content or ""
+        artifact_event(
+            "sandbox",
+            "tau2_tool_call_succeeded",
+            task_id=task.task_id,
+            domain=task.domain,
+            tool_call_id=tc.id,
+            tool=tc.name,
+            arguments=tc.arguments,
+            elapsed_seconds=time.monotonic() - started,
+            result=content,
+        )
+        return content
 
     async def _generate(messages: list[dict], tool_schemas: list[dict] | None) -> AgentTurn:
         # Discoverable banking tools can appear mid-episode.
         current = openai_tool_schemas(env) or tool_schemas
         return await generate_turn(messages, current)
 
-    episode = await run_episode(
-        generate_turn=_generate,
-        encode=encode,
-        tokenize_chat=tokenize_chat,
-        execute_tool=_execute,
-        user_reply=_user_reply,
-        tools=tools,
-        system=policy,
-        greeting=DEFAULT_GREETING,
-        first_user=first_user,
-        max_steps=max_steps,
-    )
+    try:
+        episode = await run_episode(
+            generate_turn=_generate,
+            encode=encode,
+            tokenize_chat=tokenize_chat,
+            execute_tool=_execute,
+            user_reply=_user_reply,
+            tools=tools,
+            system=policy,
+            greeting=DEFAULT_GREETING,
+            first_user=first_user,
+            max_steps=max_steps,
+        )
+    except Exception as exc:
+        artifact_event(
+            "rollouts",
+            "tau2_episode_failed",
+            task_id=task.task_id,
+            domain=task.domain,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
     episode.tau_messages = _to_tau_messages(episode.messages)
+    evaluation_started = time.monotonic()
     try:
         # evaluate_simulation is sync and can reconstruct an env (banking
         # sandbox). Running it on the event loop freezes get_batch / timeouts.
@@ -596,7 +784,28 @@ async def run_tau2_episode(
             episode.termination,
             retrieval,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("tau2 evaluate_simulation failed for %s", task.task_id)
+        artifact_event(
+            "sandbox",
+            "tau2_evaluation_failed",
+            task_id=task.task_id,
+            domain=task.domain,
+            termination=episode.termination,
+            elapsed_seconds=time.monotonic() - evaluation_started,
+            error_type=type(exc).__name__,
+            error=str(exc),
+            messages=episode.messages,
+        )
         episode.reward = 0.0
+    else:
+        artifact_event(
+            "sandbox",
+            "tau2_evaluation_succeeded",
+            task_id=task.task_id,
+            domain=task.domain,
+            termination=episode.termination,
+            elapsed_seconds=time.monotonic() - evaluation_started,
+            reward=episode.reward,
+        )
     return episode

@@ -17,6 +17,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG_ROOT="${LOG_DIR:-/log}"
+if ! mkdir -p "$LOG_ROOT" 2>/dev/null; then
+  LOG_ROOT="$ROOT/log"
+  mkdir -p "$LOG_ROOT"
+fi
+SANDBOX_LOG_FILE="${SANDBOX_LOG_FILE:-$LOG_ROOT/tau2-sandbox-setup-${TS}.log}"
+exec > >(tee -a "$SANDBOX_LOG_FILE") 2>&1
+trap 'status=$?; echo "sandbox setup finished status=$status utc=$(date -u +%FT%TZ) log=$SANDBOX_LOG_FILE"; trap - EXIT; exit "$status"' EXIT
+
+echo "sandbox setup started utc=$(date -u +%FT%TZ)"
+echo "repo=$ROOT"
+echo "commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "host=$(hostname)"
+echo "kernel=$(uname -a)"
+echo "python=$(python --version 2>&1 || true)"
+echo "node=$(node --version 2>&1 || true)"
+echo "npm=$(npm --version 2>&1 || true)"
+echo "log=$SANDBOX_LOG_FILE"
+
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -56,3 +76,8 @@ fi
 
 srt -c 'echo srt-ok'
 echo "srt: ok"
+echo "sandbox binary versions:"
+srt --version || true
+rg --version || true
+bwrap --version || true
+socat -V || true

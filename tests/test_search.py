@@ -99,6 +99,7 @@ def test_parallel_search_fills_queries_from_objective(monkeypatch):
 
 def test_parallel_search_http_error_is_observation(monkeypatch):
     monkeypatch.setenv("PARALLEL_API_KEY", "test-key")
+    events = []
 
     def fake_post(url, headers=None, json=None, timeout=None):
         resp = MagicMock()
@@ -107,5 +108,17 @@ def test_parallel_search_http_error_is_observation(monkeypatch):
         return resp
 
     monkeypatch.setattr("data.search.requests.post", fake_post)
+    monkeypatch.setattr(
+        "data.search.artifact_event",
+        lambda channel, event, **fields: events.append((channel, event, fields)),
+    )
     text, _ = parallel_search({"search_queries": ["x"]})
     assert text.startswith("web_search error: HTTP 422")
+    assert len(events) == 1
+    channel, event, fields = events[0]
+    assert (channel, event) == ("api_failures", "api_call_failed")
+    assert fields["provider"] == "parallel"
+    assert fields["cause"] == "http_error"
+    assert fields["status_code"] == 422
+    assert fields["queries"] == ["x"]
+    assert fields["response"] == '{"error": "bad"}'

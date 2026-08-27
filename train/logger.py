@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from data.diagnostics import ARTIFACT_FILES, artifact_event, configure_artifact_logging
 from reward.judge import RubricJudge, summarize
 from train.backends.backend import InferenceEngine
 from train.config import Config, to_yaml
@@ -108,6 +109,25 @@ def setup_run_logging(
         encoding="utf-8",
     )
     (log_dir / "config.yaml").write_text(to_yaml(config), encoding="utf-8")
+    if rank == 0:
+        (log_dir / "ARTIFACTS.txt").write_text(
+            "\n".join(
+                [
+                    "args.txt              exact launch command and run identity",
+                    "config.yaml           fully resolved configuration",
+                    "console.log           launcher tee output, including vLLM subprocesses",
+                    "train.log             rank-0 Python logs and training metrics",
+                    "rankN.log             nonzero FSDP-rank Python logs",
+                    "api_failures.jsonl    OpenRouter, Parallel, judge, and user-sim failures",
+                    "rollouts.jsonl        complete messages, transcripts, hints, and outcomes",
+                    "sandbox.jsonl         tau2 preflight, environment, tool, and scoring events",
+                    "training.jsonl        per-step metrics, task IDs, and policy versions",
+                    "vllm.jsonl            engine and generation request lifecycle events",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
 
     if rank == 0:
         latest = root / "latest"
@@ -129,6 +149,7 @@ def setup_run_logging(
         handlers=[stream_handler, file_handler],
         force=True,
     )
+    configure_artifact_logging(log_dir, rank=rank)
     try:
         from loguru import logger as loguru_logger
 
@@ -138,6 +159,21 @@ def setup_run_logging(
 
     logging.getLogger("sdpo").info("run %s | %s", run_name, cli)
     logging.getLogger("sdpo").info("file logs: %s", log_dir)
+    if rank == 0:
+        logging.getLogger("sdpo").info(
+            "diagnostic artifacts: %s",
+            ", ".join(ARTIFACT_FILES.values()),
+        )
+        artifact_event(
+            "training",
+            "run_started",
+            run_name=run_name,
+            cli=cli,
+            cwd=os.getcwd(),
+            dataset=config.data.dataset,
+            model=config.model.model,
+            hint=config.generator.hint.prompt,
+        )
     return RunContext(run_name=run_name, log_dir=log_dir, argv=argv, cli=cli)
 
 
@@ -204,11 +240,35 @@ async def evaluate(
         async with sem:
             return await engine.generate_tir(task)
 
-    results = await asyncio.gather(*(one(task) for task in tasks))
-    scored = await judge.score_all(
-        [(task, result.text) for task, result in zip(tasks, results)]
-    )
-    return summarize(scored)
+    results = await asyncio.gather(*(one(task) for task in tasks), return_exceptions=True)
+    successful = []
+    rollout_errors = 0
+    for task, result in zip(tasks, results):
+        if isinstance(result, BaseException):
+            rollout_errors += 1
+            logger.error(
+                "diligence eval rollout failed for task %s: %s: %s",
+                task.task_id,
+                type(result).__name__,
+                result,
+                exc_info=(type(result), result, result.__traceback__),
+            )
+            artifact_event(
+                "api_failures",
+                "evaluation_rollout_failed",
+                dataset="diligence",
+                task_id=task.task_id,
+                operation="generate_tir",
+                error_type=type(result).__name__,
+                error=str(result),
+            )
+            continue
+        successful.append((task, result.text))
+    scored = await judge.score_all(successful)
+    metrics = summarize(scored)
+    metrics["eval_rollout_errors"] = float(rollout_errors)
+    metrics["eval_requested"] = float(len(tasks))
+    return metrics
 
 
 async def evaluate_pass1(
@@ -221,10 +281,33 @@ async def evaluate_pass1(
         async with sem:
             return task, await engine.generate_tir(task)
 
-    pairs = await asyncio.gather(*(one(task) for task in tasks))
+    results = await asyncio.gather(*(one(task) for task in tasks), return_exceptions=True)
     overall: list[float] = []
     by_domain: dict[str, list[float]] = defaultdict(list)
-    for task, result in pairs:
+    rollout_errors = 0
+    for task, outcome in zip(tasks, results):
+        if isinstance(outcome, BaseException):
+            rollout_errors += 1
+            logger.error(
+                "tau2 pass1 rollout failed for task %s (%s): %s: %s",
+                task.task_id,
+                getattr(task, "domain", None) or "unknown",
+                type(outcome).__name__,
+                outcome,
+                exc_info=(type(outcome), outcome, outcome.__traceback__),
+            )
+            artifact_event(
+                "api_failures",
+                "evaluation_rollout_failed",
+                dataset="tau2",
+                task_id=task.task_id,
+                domain=getattr(task, "domain", None),
+                operation="generate_tir",
+                error_type=type(outcome).__name__,
+                error=str(outcome),
+            )
+            continue
+        _, result = outcome
         score = float(result.judge_score or 0.0)
         overall.append(score)
         domain = getattr(task, "domain", None) or "unknown"
@@ -236,6 +319,8 @@ async def evaluate_pass1(
     metrics = {
         "pass1": _mean(overall),
         "n": float(len(overall)),
+        "eval_rollout_errors": float(rollout_errors),
+        "eval_requested": float(len(tasks)),
     }
     for domain, scores in sorted(by_domain.items()):
         metrics[f"pass1_{domain}"] = _mean(scores)
@@ -270,5 +355,14 @@ async def evaluate_and_log(
             return
         if wandb.run is not None:
             wandb.log(payload)
-    except Exception:
+    except Exception as exc:
         logger.exception("eval failed (launched at step %d)", step)
+        artifact_event(
+            "api_failures",
+            "evaluation_coordinator_failed",
+            dataset=dataset,
+            launched_at_step=step,
+            policy_version=policy_version,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )

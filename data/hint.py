@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from train.config import Config
 from data.dataset import Task
+from data.diagnostics import artifact_event
 from reward.judge import chat_completion
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,17 @@ async def build_error_hint(
             )
         )
         logger.warning("OPENROUTER_API_KEY is unset; cannot generate %s hint", prompt_variant)
+        artifact_event(
+            "api_failures",
+            "hint_generation_failed",
+            provider="openrouter",
+            operation="hint_generation",
+            model=model,
+            prompt_variant=prompt_variant,
+            cause="openrouter_auth",
+            error="OPENROUTER_API_KEY is unset",
+            query=query,
+        )
         return ""
 
     if user_prompt is None:
@@ -141,6 +153,18 @@ async def build_error_hint(
             failure.cause,
             failure.detail,
         )
+        artifact_event(
+            "api_failures",
+            "hint_generation_failed",
+            provider="openrouter",
+            operation="hint_generation",
+            model=model,
+            prompt_variant=prompt_variant,
+            cause=failure.cause,
+            error=failure.detail,
+            query=query,
+            response_text=response_text,
+        )
         return ""
 
     generated = generated.strip()
@@ -150,6 +174,18 @@ async def build_error_hint(
                 cause="empty",
                 detail="OpenRouter returned empty hint content",
             )
+        )
+        artifact_event(
+            "api_failures",
+            "hint_generation_failed",
+            provider="openrouter",
+            operation="hint_generation",
+            model=model,
+            prompt_variant=prompt_variant,
+            cause="empty",
+            error="OpenRouter returned empty hint content",
+            query=query,
+            response_text=response_text,
         )
         return ""
     if prompt_variant == "step_hint":

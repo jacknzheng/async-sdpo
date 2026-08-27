@@ -48,12 +48,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Iterator
 
 from train.config import Config
+from data.diagnostics import artifact_event
 from data.dataset import Task, build_prompt
 from train.models import RolloutResult
 from train.backends.backend import InferenceEngine, WeightBucket, WeightTransport
@@ -187,12 +189,35 @@ class VLLMRolloutEngine(InferenceEngine):
         # starts in __init__. There is no start()/await to call. Isolation must wrap
         # THIS call: spawn snapshots os.environ at Process.start().
         stripped = _torchrun_env_keys()
+        started = time.monotonic()
+        artifact_event(
+            "vllm",
+            "engine_starting",
+            model=self.model,
+            tensor_parallel_size=self.config.generator.engine.n_rollout_gpus,
+            max_model_len=self.config.generator.engine.max_model_len,
+            gpu_memory_utilization=(
+                self.config.generator.engine.gpu_memory_utilization
+            ),
+            stripped_torchrun_env=stripped,
+        )
         with isolated_from_torchrun():
             logger.info(
                 "starting rollout engine isolated from torchrun (stripped %s)",
                 stripped or "nothing",
             )
-            self.engine = AsyncLLM.from_engine_args(engine_args)
+            try:
+                self.engine = AsyncLLM.from_engine_args(engine_args)
+            except Exception as exc:
+                artifact_event(
+                    "vllm",
+                    "engine_start_failed",
+                    model=self.model,
+                    elapsed_seconds=time.monotonic() - started,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
         try:
             self.tokenizer = self.engine.get_tokenizer()
         except Exception:
@@ -205,6 +230,13 @@ class VLLMRolloutEngine(InferenceEngine):
             "rollout engine ready: %s on %d GPU(s)",
             self.model,
             self.config.generator.engine.n_rollout_gpus,
+        )
+        artifact_event(
+            "vllm",
+            "engine_ready",
+            model=self.model,
+            tensor_parallel_size=self.config.generator.engine.n_rollout_gpus,
+            elapsed_seconds=time.monotonic() - started,
         )
 
     def _sampling_params(self):
@@ -260,21 +292,75 @@ class VLLMRolloutEngine(InferenceEngine):
         """Run one vLLM generate call; return (prompt_token_ids, completion)."""
         from vllm import TokensPrompt
 
+        started = time.monotonic()
+        artifact_event(
+            "vllm",
+            "generation_started",
+            request_id=request_id,
+            policy_version=self.policy_version,
+            prompt_kind="token_ids" if isinstance(prompt, list) else "text",
+            prompt_size=len(prompt),
+        )
         request_input = (
             TokensPrompt(prompt_token_ids=prompt)
             if isinstance(prompt, list)
             else prompt
         )
         final_output = None
-        async for output in self.engine.generate(
-            prompt=request_input, sampling_params=self._sampling_params(), request_id=request_id
-        ):
-            final_output = output
+        try:
+            async for output in self.engine.generate(
+                prompt=request_input,
+                sampling_params=self._sampling_params(),
+                request_id=request_id,
+            ):
+                final_output = output
+        except Exception as exc:
+            logger.exception("vLLM generation failed for request %s", request_id)
+            artifact_event(
+                "vllm",
+                "generation_failed",
+                request_id=request_id,
+                policy_version=self.policy_version,
+                elapsed_seconds=time.monotonic() - started,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
         if final_output is None:
+            artifact_event(
+                "vllm",
+                "generation_failed",
+                request_id=request_id,
+                policy_version=self.policy_version,
+                elapsed_seconds=time.monotonic() - started,
+                error_type="RuntimeError",
+                error="generation stream returned no output",
+            )
             raise RuntimeError(f"no output for request {request_id}")
         if not final_output.outputs:
+            artifact_event(
+                "vllm",
+                "generation_failed",
+                request_id=request_id,
+                policy_version=self.policy_version,
+                elapsed_seconds=time.monotonic() - started,
+                error_type="RuntimeError",
+                error="generation finished with no candidate output",
+            )
             raise RuntimeError(f"request {request_id} finished with no output (aborted?)")
-        return list(final_output.prompt_token_ids), final_output.outputs[0]
+        completion = final_output.outputs[0]
+        artifact_event(
+            "vllm",
+            "generation_succeeded",
+            request_id=request_id,
+            policy_version=self.policy_version,
+            elapsed_seconds=time.monotonic() - started,
+            prompt_tokens=len(final_output.prompt_token_ids),
+            completion_tokens=len(completion.token_ids),
+            finish_reason=getattr(completion, "finish_reason", None),
+            stop_reason=getattr(completion, "stop_reason", None),
+        )
+        return list(final_output.prompt_token_ids), completion
 
     # ---- generation ----
 
@@ -354,6 +440,23 @@ class VLLMRolloutEngine(InferenceEngine):
             text = episode.transcript
             score = episode.reward if episode.reward else None
 
+        artifact_event(
+            "rollouts",
+            "episode_completed",
+            dataset="tau2" if task.domain else "diligence",
+            task_id=task.task_id,
+            domain=task.domain,
+            policy_version=self.policy_version,
+            termination=episode.termination,
+            reward=episode.reward,
+            prompt_tokens=len(episode.prompt_token_ids),
+            response_tokens=len(episode.response_token_ids),
+            sampled_tokens=sum(episode.loss_mask),
+            injected_tokens=len(episode.loss_mask) - sum(episode.loss_mask),
+            step_spans=episode.step_spans,
+            transcript=episode.transcript,
+            messages=episode.messages,
+        )
         return RolloutResult(
             task_id=task.task_id,
             prompt_token_ids=episode.prompt_token_ids,

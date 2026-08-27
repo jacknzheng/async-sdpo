@@ -41,6 +41,7 @@ from train.store import Trajectory
 import argparse
 
 from data.dataset import Task, TaskDataset
+from data.diagnostics import artifact_event
 from data.hint import generate_hint
 from data.tau_harness import configure_embeddings_cache
 
@@ -272,8 +273,18 @@ async def generate_trajectory(
     """
     try:
         result = await engine.generate_tir(task)
-    except Exception:
+    except Exception as exc:
         logger.exception("rollout failed for task %s", task.task_id)
+        artifact_event(
+            "rollouts",
+            "rollout_rejected",
+            task_id=task.task_id,
+            domain=task.domain,
+            policy_version=version,
+            stage="generation",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         await staleness_manager.on_rollout_rejected()
         return
     # generate the hint before adding to the store!
@@ -287,6 +298,17 @@ async def generate_trajectory(
             task.task_id,
             cause,
             hints.detail or "unavailable",
+        )
+        artifact_event(
+            "rollouts",
+            "rollout_rejected",
+            task_id=task.task_id,
+            domain=task.domain,
+            policy_version=version,
+            stage="hint_generation",
+            cause=cause,
+            error=hints.detail or "unavailable",
+            response_text=result.text,
         )
         await staleness_manager.on_rollout_rejected()
         return
@@ -305,6 +327,20 @@ async def generate_trajectory(
             step_spans=list(result.step_spans),
             loss_mask=list(result.loss_mask),
         )
+    )
+    artifact_event(
+        "rollouts",
+        "rollout_accepted",
+        task_id=task.task_id,
+        domain=task.domain,
+        policy_version=version,
+        response_text=result.text,
+        hint_free=hints.free,
+        hint_bearing=hints.bearing,
+        judge_score=result.judge_score,
+        prompt_tokens=len(result.prompt_token_ids),
+        response_tokens=len(result.response_token_ids),
+        sampled_tokens=sum(result.loss_mask) if result.loss_mask else len(result.response_token_ids),
     )
 
 async def run_loop(
@@ -497,6 +533,17 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                 await trainer.staleness_manager.notify_capacity_change(
                     trainer.state.step + 1
                 )
+                artifact_event(
+                    "training",
+                    "train_step_completed",
+                    step=trainer.state.step,
+                    policy_version=trainer.state.policy_version,
+                    task_ids=[trajectory.task_id for trajectory in batch],
+                    trajectory_policy_versions=[
+                        trajectory.policy_version for trajectory in batch
+                    ],
+                    metrics={**metrics, **store.metrics()},
+                )
                 if trainer.state.step % config.logging.log_interval == 0:
                     log_metrics(metrics, store)
                     if wandb is not None:
@@ -627,6 +674,7 @@ def main() -> None:
         try:
             assert_sandbox_ready(config.data.domains)
         except SandboxNamespaceError as exc:
+            logger.critical("tau2 sandbox preflight failed: %s", exc)
             raise SystemExit(f"tau2 sandbox not usable:\n{exc}") from exc
     if world > 1:
         if world != config.trainer.n_trainer_gpus:
@@ -653,6 +701,16 @@ def main() -> None:
                 asyncio.run(baseline(config, ctx=ctx))
         else: 
             asyncio.run(train(config, smoke=args.smoke, ctx=ctx))
+    except Exception as exc:
+        logger.exception("run failed")
+        if rank == 0:
+            artifact_event(
+                "training",
+                "run_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        raise
     finally:
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
