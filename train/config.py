@@ -120,9 +120,7 @@ HINT_PROMPTS = (
 @dataclass(frozen=True)
 class HintConfig(BaseConfig):
     prompt: str = "gold"
-    # OpenRouter retired stealth/ox-alpha and identified this as the same
-    # underlying model's permanent slug.
-    model: str = "z-ai/glm-5.3-flash"
+    model: str = "nvidia/nemotron-3-super-120b-a12b:free"
     concurrency: int = 4
     timeout: float = 90.0
     max_retries: int = 5
@@ -283,7 +281,7 @@ class DataConfig(BaseConfig):
     n_heldout: int = 27
     split_seed: int = 0
     retrieval: str = "alltools-qwen"
-    user_llm: str = "openrouter/z-ai/glm-5.3-flash"
+    user_llm: str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
     # Parallel Search (diligence TIR only). https://docs.parallel.ai/search/search-quickstart
     search_mode: str = "fast"
     search_timeout: float = 30.0
@@ -308,7 +306,7 @@ class DataConfig(BaseConfig):
 
 @dataclass(frozen=True)
 class JudgeConfig(BaseConfig):
-    model: str = "z-ai/glm-5.3-flash"
+    model: str = "nvidia/nemotron-3-super-120b-a12b:free"
     max_concurrency: int = 4
     max_retries: int = 5
     timeout: float = 120.0
@@ -320,6 +318,8 @@ class LoggingConfig(BaseConfig):
     log_interval: int = 1
     checkpoint_interval: int = 50
     output_dir: str = "runs/sdpo-tau2"
+    # Path to state.pt, its step directory, or "latest" under output_dir.
+    resume_from: str | None = None
     # Rank-0 writes train.log / args.txt / config.yaml here. Default `/log` on the
     # 8xH100 box; falls back to ./log if that path is not writable.
     log_dir: str = "/log"

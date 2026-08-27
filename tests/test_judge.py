@@ -204,10 +204,14 @@ def test_missing_api_key_fails_at_construction(monkeypatch):
 
 
 def test_valid_response_parses(monkeypatch):
-    gen, _ = _generator(monkeypatch, [_ok()])
+    gen, sent = _generator(monkeypatch, [_ok()])
     output = asyncio.run(gen("sys", "user"))
     assert isinstance(output, OneShotOutput)
     assert output.criteria_evaluations[0].criterion_status == "MET"
+    assert (
+        json.loads(sent[0]["data"])["model"]
+        == "nvidia/nemotron-3-super-120b-a12b:free"
+    )
 
 
 def test_request_payload_is_correct(monkeypatch):
@@ -231,7 +235,7 @@ def test_request_payload_is_correct(monkeypatch):
 
 
 def test_glm_uses_json_object_route_with_schema_validation(monkeypatch):
-    gen, sent = _generator(monkeypatch, [_ok()])
+    gen, sent = _generator(monkeypatch, [_ok()], model="z-ai/glm-5.3-flash")
     asyncio.run(gen("sys", "user"))
 
     payload = json.loads(sent[0]["data"])
@@ -257,13 +261,13 @@ def test_malformed_json_is_retried_then_succeeds(monkeypatch):
     assert output.criteria_evaluations[0].criterion_status == "MET"
 
 
-def test_timeout_is_retried_then_surfaces(monkeypatch):
+def test_timeout_retries_both_schema_modes_then_surfaces(monkeypatch):
     gen, sent = _generator(
-        monkeypatch, [requests.Timeout("slow")] * 3, max_retries=3
+        monkeypatch, [requests.Timeout("slow")] * 6, max_retries=3
     )
     with pytest.raises(RuntimeError, match="failed after 3 attempts"):
         asyncio.run(gen("sys", "user"))
-    assert len(sent) == 3
+    assert len(sent) == 6
 
 
 def test_server_error_is_retried(monkeypatch):

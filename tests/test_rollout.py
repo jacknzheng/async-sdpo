@@ -346,7 +346,7 @@ def test_hint_receives_the_configured_prompt_variant(monkeypatch):
     assert seen["prompt_variant"] == "answer_bearing"
     assert seen["response_text"] == "the draft text"
     assert seen["query"] == "Assess the funding base."
-    assert seen["model"] == "z-ai/glm-5.3-flash"
+    assert seen["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
     assert seen["max_retries"] == 5
     assert seen["max_tokens"] == 2048
     assert seen["reasoning_enabled"] is False

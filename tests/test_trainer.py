@@ -239,19 +239,36 @@ def test_checkpoint_roundtrip_preserves_ema_and_step():
 def test_save_checkpoint_writes_loadable_state(tmp_path):
     """run.py's checkpoint file must round-trip through load_state_dict -- weights, step,
     and the EMA clipper. A RunPod interruption is survivable only if this works."""
-    from run import save_checkpoint
+    from run import load_checkpoint, save_checkpoint
 
     trainer = _trainer()
     trainer.train_step([_traj(), _traj(task_id="2")])
     save_checkpoint(trainer, str(tmp_path), 7)
 
     restored = _trainer()
-    restored.load_state_dict(torch.load(tmp_path / "step_7" / "state.pt"))
+    load_checkpoint(restored, tmp_path / "step_7" / "state.pt")
 
     assert restored.state.step == trainer.state.step
     assert restored.state.clipper.ema == trainer.state.clipper.ema
+    assert restored.staleness_manager._current_global_step == trainer.state.step + 1
     for a, b in zip(restored.model.parameters(), trainer.model.parameters()):
         torch.testing.assert_close(a, b)
+
+
+def test_latest_checkpoint_selects_highest_numeric_step(tmp_path):
+    from run import resolve_checkpoint_path
+
+    for name in ("step_5", "step_100", "step_final"):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "state.pt").touch()
+
+    assert resolve_checkpoint_path("latest", str(tmp_path)) == (
+        tmp_path / "step_100" / "state.pt"
+    )
+    assert resolve_checkpoint_path(str(tmp_path / "step_5"), "unused") == (
+        tmp_path / "step_5" / "state.pt"
+    )
 
 
 def test_trainer_state_roundtrip():

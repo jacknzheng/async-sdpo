@@ -215,6 +215,81 @@ def save_checkpoint(trainer: SDPOTrainer, output_dir: str, tag) -> None:
     logger.info("checkpoint saved: %s", path / "state.pt")
 
 
+def resolve_checkpoint_path(resume_from: str, output_dir: str) -> Path:
+    """Resolve an explicit checkpoint or the newest numeric step checkpoint."""
+    if resume_from == "latest":
+        candidates: list[tuple[int, Path]] = []
+        for path in Path(output_dir).glob("step_*/state.pt"):
+            try:
+                step = int(path.parent.name.removeprefix("step_"))
+            except ValueError:
+                continue
+            candidates.append((step, path))
+        if not candidates:
+            raise FileNotFoundError(
+                f"no numeric step checkpoints found under {output_dir}"
+            )
+        return max(candidates, key=lambda item: item[0])[1]
+
+    path = Path(resume_from).expanduser()
+    if path.is_dir():
+        path = path / "state.pt"
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint does not exist: {path}")
+    return path
+
+
+def load_checkpoint(trainer: SDPOTrainer, path: Path, *, rank: int = 0) -> None:
+    """Restore model, optimizer, trainer counters, and producer staleness state.
+
+    Every FSDP rank must enter this function because ``set_state_dict`` is
+    collective. Checkpoints contain full CPU state, so each rank reads the
+    same file and PyTorch reshards it while loading.
+    """
+    started = time.monotonic()
+    if rank == 0:
+        logger.info("loading checkpoint: %s", path)
+        artifact_event(
+            "training",
+            "checkpoint_load_started",
+            checkpoint=str(path),
+        )
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        trainer.load_state_dict(state)
+        # The manager tracks the step currently being produced. Trainer state
+        # stores completed steps, hence the +1.
+        trainer.staleness_manager.load_state_from_checkpoint(
+            trainer.state.step + 1
+        )
+    except Exception as exc:
+        if rank == 0:
+            artifact_event(
+                "training",
+                "checkpoint_load_failed",
+                checkpoint=str(path),
+                elapsed_seconds=time.monotonic() - started,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        raise
+    if rank == 0:
+        logger.info(
+            "checkpoint loaded: %s (step=%d, policy_version=%d)",
+            path,
+            trainer.state.step,
+            trainer.state.policy_version,
+        )
+        artifact_event(
+            "training",
+            "checkpoint_load_succeeded",
+            checkpoint=str(path),
+            step=trainer.state.step,
+            policy_version=trainer.state.policy_version,
+            elapsed_seconds=time.monotonic() - started,
+        )
+
+
 async def sync_weights(
     trainer: SDPOTrainer,
     engine: InferenceEngine | None,
@@ -484,6 +559,13 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
     if rank == 0:
         logger.info("loaded %d train / %d held-out tasks", len(train_tasks), len(heldout_tasks))
 
+    resume_path = None
+    if config.logging.resume_from is not None:
+        resume_path = resolve_checkpoint_path(
+            config.logging.resume_from,
+            config.logging.output_dir,
+        )
+
     engine_cls, transport_cls = get_backend(config.generator.engine.backend)
 
     # Rank 0 starts vLLM BEFORE the trainer process group exists. The engine's TP
@@ -520,6 +602,8 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
     trainer = build_trainer(
         config, smoke, train_tasks + heldout_tasks, transport=transport_cls() if rank == 0 else None
     )
+    if resume_path is not None:
+        load_checkpoint(trainer, resume_path, rank=rank)
 
     if rank == 0:
         weight_world_size = config.generator.engine.n_rollout_gpus + 1
@@ -539,6 +623,23 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                 weight_world_size,
             ),
         )
+
+    # Nonzero FSDP ranks can reach this point while rank 0 is still setting up
+    # the rollout weight-transfer group. A resumed sync is collective across
+    # all trainer ranks, so release them together only after that group exists.
+    if resume_path is not None:
+        if world > 1:
+            dist.barrier()
+        await sync_weights(
+            trainer,
+            engine,
+            store,
+            trainer.state.policy_version,
+            rank=rank,
+            world=world,
+        )
+
+    if rank == 0:
         stop = asyncio.Event()
         train_loader = build_dataloader(
             config, TaskDataset(train_tasks), is_train=True, is_fully_async=True

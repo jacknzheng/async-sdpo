@@ -108,12 +108,16 @@ def test_default_is_proven_tau2_8b_stack():
     assert cfg.generator.engine.max_model_len == 16384
     assert cfg.generator.engine.disable_custom_all_reduce is True
     assert cfg.generator.hint.prompt == "gold"
-    assert cfg.generator.hint.model == "z-ai/glm-5.3-flash"
+    assert cfg.generator.hint.model == "nvidia/nemotron-3-super-120b-a12b:free"
     assert cfg.generator.hint.max_tokens == 2048
     assert cfg.generator.hint.reasoning_enabled is False
-    assert cfg.data.user_llm == "openrouter/z-ai/glm-5.3-flash"
-    assert cfg.judge.model == "z-ai/glm-5.3-flash"
+    assert (
+        cfg.data.user_llm
+        == "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    )
+    assert cfg.judge.model == "nvidia/nemotron-3-super-120b-a12b:free"
     assert cfg.logging.log_dir == "/log"
+    assert cfg.logging.resume_from is None
     assert cfg.logging.wandb_enabled is True
     assert cfg.trainer.algorithm.use_sod is True
     assert cfg.trainer.algorithm.sod_delta == 0.2
@@ -143,6 +147,11 @@ def test_zero_hint_retries_rejected():
 def test_zero_hint_max_tokens_rejected():
     with pytest.raises(ValueError, match="max_tokens"):
         Config.from_cli_overrides(["generator.hint.max_tokens=0"])
+
+
+def test_resume_checkpoint_accepts_latest_selector():
+    cfg = Config.from_cli_overrides(["logging.resume_from=latest"])
+    assert cfg.logging.resume_from == "latest"
 
 
 # ---- the nesting machinery itself ----

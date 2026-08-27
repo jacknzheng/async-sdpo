@@ -338,7 +338,7 @@ class OpenRouterOneShotGenerator:
 
     def __init__(
         self,
-        model: str = "z-ai/glm-5.3-flash",
+        model: str = "nvidia/nemotron-3-super-120b-a12b:free",
         max_retries: int = 3,
         max_tokens: int = 16000,
         timeout: float = 120.0,
@@ -370,7 +370,7 @@ class RubricJudge:
 
     def __init__(
         self,
-        model: str = "z-ai/glm-5.3-flash",
+        model: str = "nvidia/nemotron-3-super-120b-a12b:free",
         max_concurrency: int = 8,
         max_retries: int = 3,
         timeout: float = 120.0,

@@ -235,6 +235,12 @@ Defaults live in `train/config.py`. Trailing dotted CLI args override them
 (`trainer.optimizer.learning_rate=1e-5`). Every field must already exist on the
 dataclasses — `+new.field=...` is rejected.
 
+Resume a run with `logging.resume_from=/path/to/step_50`, an explicit
+`state.pt`, or `logging.resume_from=latest` to select the newest numeric step
+under `logging.output_dir`. Resume restores model, optimizer, step, policy
+version, advantage EMA, and producer staleness state, then synchronizes the
+restored weights into vLLM before any new rollout starts.
+
 | Setting            | Value                             | Notes                       |
 | ------------------ | --------------------------------- | --------------------------- |
 | model              | `Qwen/Qwen3-8B`                   | smoke: `Qwen/Qwen3-0.6B`    |
@@ -281,17 +287,17 @@ for the first ~100 steps — exactly when training is least stable.
 
 ## Hints are error-conditioned
 
-On diligence (and tau2 `step_hint`), every hint is written **per rollout** by an LLM
-(`z-ai/glm-5.3-flash` on OpenRouter, the permanent slug for the retired
-`stealth/ox-alpha`) that reads the draft the student actually produced.
+On diligence (and tau2 `step_hint`), every hint is written **per rollout** by
+`nvidia/nemotron-3-super-120b-a12b:free` on OpenRouter, which reads the draft
+the student actually produced.
 Two rollouts of the same task get different hints. Tau2 `gold` skips the LLM and injects
 Sierra gold / the canonical tool trajectory instead.
 
 A hint request disables model reasoning and reserves 2,048 tokens for visible
 output. Both are independently configurable through
 `generator.hint.reasoning_enabled` and `generator.hint.max_tokens`. Reasoning
-must remain off for GLM hints: OpenRouter counts hidden reasoning against the
-same output budget, which otherwise produces empty `finish_reason=length`
+must remain off for hints: OpenRouter counts hidden reasoning against the same
+output budget, which can otherwise produce empty `finish_reason=length`
 responses.
 
 A rollout whose hint cannot be generated is **dropped**, not trained with an empty hint:

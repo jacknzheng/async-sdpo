@@ -295,6 +295,7 @@ def test_hint_request_sends_no_response_format(monkeypatch):
     sent = _stub_openrouter(monkeypatch, "- how deposit cost trended against balances")
     _build("answer_free")
     payload = json.loads(sent[0]["data"])
+    assert payload["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
     assert "response_format" not in payload
     assert "provider" not in payload
     assert payload["temperature"] == 0.0
