@@ -43,7 +43,7 @@ import argparse
 
 from data.dataset import Task, TaskDataset
 from data.diagnostics import artifact_event
-from data.hint import generate_hint
+from data.hint import generate_hint, set_hint_engine
 from data.tau_harness import configure_embeddings_cache
 
 import torch
@@ -530,6 +530,43 @@ def _pick_weight_sync_port(host: str, preferred: int) -> int:
     raise RuntimeError(f"could not bind a weight-sync port on {host}")
 
 
+def assert_visible_gpus(config: Config) -> None:
+    """Refuse to start if the box is smaller than the reserved 4+4+1 map.
+
+    The operator default is 2 GPUs. This job requests 9 and does not degrade.
+    """
+    required = config.reserved_gpus()
+    env_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if env_visible is not None and env_visible.strip() != "":
+        visible = len([part for part in env_visible.split(",") if part.strip() != ""])
+    else:
+        visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if visible >= required:
+        return
+    nvidia = ""
+    try:
+        import subprocess
+
+        nvidia = subprocess.check_output(
+            ["nvidia-smi", "-L"], text=True, timeout=5
+        ).strip()
+    except Exception as exc:  # noqa: BLE001 -- diagnostic only
+        nvidia = f"nvidia-smi unavailable ({type(exc).__name__}: {exc})"
+    hint = (
+        f" + 1 hint (cuda:{config.generator.hint.gpu})"
+        if config.generator.hint.backend == "vllm"
+        else ""
+    )
+    raise SystemExit(
+        f"need {required} visible GPUs "
+        f"({config.generator.engine.n_rollout_gpus} rollout + "
+        f"{config.trainer.n_trainer_gpus} trainer{hint}); saw {visible}. "
+        "Operator default of 2 is not enough; request a 9-GPU box "
+        "(4 rollout + 4 trainer + 1 hint). Do not shrink to 3+4+1 or 1+1.\n"
+        f"{nvidia}"
+    )
+
+
 def _init_trainer_process_group(config: Config) -> None:
     """Join the FSDP group. Rank 0 must call this AFTER the rollout engine has spawned.
 
@@ -571,6 +608,7 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
     # (or a live default process group) they hang on TCPStore instead of forming
     # their own. Other ranks skip this and wait at init_process_group.
     engine = None
+    hint_engine = None
     store = None
     judge = None
     stop = None
@@ -581,6 +619,12 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
             config.generator.engine.store_capacity,
             config.trainer.algorithm.max_staleness,
         )
+        if config.uses_local_hint_engine():
+            from train.backends.vllm import HintEngine
+
+            hint_engine = HintEngine(config)
+            hint_engine.start()
+            set_hint_engine(hint_engine)
         engine = engine_cls(
             config, model=config.model.smoke_model if smoke else config.model.model
         )
@@ -722,6 +766,9 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                 rollout_task.cancel()
             if engine is not None:
                 await engine.shutdown()
+            if hint_engine is not None:
+                await hint_engine.shutdown()
+            set_hint_engine(None)
             if wandb is not None:
                 wandb.finish()
 
@@ -785,6 +832,7 @@ def main() -> None:
             "trainer.n_trainer_gpus=1",
             "trainer.compile_trainer=false",
             "generator.engine.n_rollout_gpus=1",
+            "generator.hint.backend=openrouter",
             "judge.eval_interval=5",
         ]
     if args.hint_prompt:
@@ -797,6 +845,8 @@ def main() -> None:
     # Rank 0, before NCCL: `which bwrap` is a false green on GPU pods that
     # seccomp-block unshare. Fail here so we do not spend an hour generating
     # zero-reward banking episodes.
+    if rank == 0:
+        assert_visible_gpus(config)
     if rank == 0 and config.data.dataset == "tau2":
         from data.tau_harness import SandboxNamespaceError, assert_sandbox_ready
 

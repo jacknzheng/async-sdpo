@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tau-bench SDPO on 8x H100 (4 vLLM rollout + 4 FSDP trainer).
+# Tau-bench SDPO on 9 GPUs (4 vLLM rollout + 4 FSDP trainer + 1 hint).
 #
 # Usage:
 #   bash scripts/run_taubench.sh <mode> [extra dotted overrides...]
@@ -7,7 +7,7 @@
 # Modes
 #   gold          Ablation A. Teacher sees Sierra gold docs (banking) / canonical
 #                 tool trajectory (retail, airline). No hint LLM. Cheap. Default.
-#   step_hint     Ablation B. After each rollout, an OpenRouter LLM names the
+#   step_hint     Ablation B. After each rollout, the local hint GPU names the
 #                 SINGLE next correct action given the gold + transcript.
 #   baseline      Zero-shot pass^1 on the 87 held-out tasks. No training.
 #   smoke         1 GPU, tiny model, 10 steps. Sanity check the loop, not a result.
@@ -18,7 +18,7 @@
 #   bash scripts/run_taubench.sh step_hint trainer.total_steps=200
 #   bash scripts/run_taubench.sh baseline
 #
-# Needs: 8x H100, OPENROUTER_API_KEY, WANDB_API_KEY,
+# Needs: 9 GPUs (4+4+1), OPENROUTER_API_KEY (tau2 user sim), WANDB_API_KEY,
 #        `uv sync --extra knowledge`, `bash scripts/setup_tau2_sandbox.sh`
 #        `which` is not enough — bwrap must be able to create namespaces
 #        (--privileged / seccomp=unconfined). run.py probes this and exits.
@@ -53,7 +53,7 @@ mkdir -p "${LOG_ROOT}/${RUN}" || {
   mkdir -p "${LOG_ROOT}/${RUN}"
 }
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export WANDB_PROJECT="${WANDB_PROJECT:-sdpo-tau2}"

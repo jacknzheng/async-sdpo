@@ -103,7 +103,12 @@ def setup_run_logging(
                 f"hint: {config.generator.hint.prompt}",
                 f"model: {config.model.model}",
                 f"gpus: {config.generator.engine.n_rollout_gpus} rollout + "
-                f"{config.trainer.n_trainer_gpus} trainer",
+                f"{config.trainer.n_trainer_gpus} trainer"
+                + (
+                    f" + 1 hint (cuda:{config.generator.hint.gpu})"
+                    if config.generator.hint.backend == "vllm"
+                    else ""
+                ),
                 "",
             ]
         ),

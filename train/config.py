@@ -115,12 +115,20 @@ HINT_PROMPTS = (
     "gold",
     "step_hint",
 )
+HINT_LLM_PROMPTS = frozenset(
+    {"answer_free", "answer_bearing", "mixture", "step_hint"}
+)
+HINT_BACKENDS = ("vllm", "openrouter")
 
 
 @dataclass(frozen=True)
 class HintConfig(BaseConfig):
     prompt: str = "gold"
-    model: str = "nvidia/nemotron-3-super-120b-a12b:free"
+    # Frozen one-GPU vLLM by default. openrouter remains an explicit fallback.
+    backend: str = "vllm"
+    model: str = "Qwen/Qwen3.5-9B"
+    # Last visible device on the 4+4+1 / 9-GPU map (cuda:8).
+    gpu: int = 8
     concurrency: int = 4
     timeout: float = 90.0
     max_retries: int = 5
@@ -134,6 +142,12 @@ class HintConfig(BaseConfig):
             raise ValueError(
                 f"generator.hint.prompt must be one of {HINT_PROMPTS}, got {self.prompt!r}"
             )
+        if self.backend not in HINT_BACKENDS:
+            raise ValueError(
+                f"generator.hint.backend must be one of {HINT_BACKENDS}, got {self.backend!r}"
+            )
+        if self.gpu < 0:
+            raise ValueError("generator.hint.gpu must be >= 0")
         if self.concurrency < 1:
             raise ValueError("generator.hint.concurrency must be >= 1")
         if self.max_retries < 1:
@@ -321,7 +335,7 @@ class LoggingConfig(BaseConfig):
     # Path to state.pt, its step directory, or "latest" under output_dir.
     resume_from: str | None = None
     # Rank-0 writes train.log / args.txt / config.yaml here. Default `/log` on the
-    # 8xH100 box; falls back to ./log if that path is not writable.
+    # 9-GPU box; falls back to ./log if that path is not writable.
     log_dir: str = "/log"
     run_name: str = ""
     wandb_project: str = "sdpo-tau2"
@@ -338,15 +352,39 @@ class Config(BaseConfig):
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
-    total_num_gpus: int = 8
+    total_num_gpus: int = 9
     num_workers: int = 4 * total_num_gpus
 
+    def reserved_gpus(self) -> int:
+        """Visible devices this config claims: rollout + trainer + optional hint GPU."""
+        n = self.generator.engine.n_rollout_gpus + self.trainer.n_trainer_gpus
+        if self.generator.hint.backend == "vllm":
+            n += 1
+        return n
+
+    def uses_local_hint_engine(self) -> bool:
+        return (
+            self.generator.hint.backend == "vllm"
+            and self.generator.hint.prompt in HINT_LLM_PROMPTS
+        )
+
     def __post_init__(self) -> None:
-        total = self.generator.engine.n_rollout_gpus + self.trainer.n_trainer_gpus
-        if total > self.total_num_gpus:
-            raise ValueError(f"GPU split must sum to <= {self.total_num_gpus}, got {total}")
-        if self.generator.engine.n_rollout_gpus < 1 or self.trainer.n_trainer_gpus < 1:
+        n_rollout = self.generator.engine.n_rollout_gpus
+        n_trainer = self.trainer.n_trainer_gpus
+        if n_rollout < 1 or n_trainer < 1:
             raise ValueError("need at least 1 rollout GPU and 1 trainer GPU")
+        total = self.reserved_gpus()
+        if total > self.total_num_gpus:
+            raise ValueError(
+                f"GPU split must sum to <= {self.total_num_gpus}, got {total}"
+            )
+        if self.generator.hint.backend == "vllm":
+            hint_gpu = self.generator.hint.gpu
+            trainer_end = n_rollout + n_trainer
+            if hint_gpu < trainer_end:
+                raise ValueError(
+                    f"hint GPU {hint_gpu} overlaps rollout/trainer range 0..{trainer_end - 1}"
+                )
 
     @classmethod
     def from_cli_overrides(cls, args: Optional[List[str]] = None) -> "Config":

@@ -126,6 +126,197 @@ def isolated_from_torchrun() -> Iterator[None]:
         os.environ.update(saved)
 
 
+@contextmanager
+def pinned_visible_device(gpu: int) -> Iterator[None]:
+    """Restrict CUDA_VISIBLE_DEVICES to one physical index for a spawn, then restore.
+
+    Must wrap the call that forks hint-engine workers, and must run before the parent
+    initializes CUDA. Restore the full 0-8 map before trainer / rollout CUDA init so
+    those processes still see every device.
+    """
+    saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+
+class HintEngine:
+    """Frozen one-GPU vLLM for error-conditioned hints. No weight sync.
+
+    Not an InferenceEngine: it never joins the NCCL transfer group and never sees
+    trainer weights. Lives on cuda:{hint.gpu} (default 8) for the life of the run.
+    """
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.model = config.generator.hint.model
+        self.engine = None
+        self.tokenizer = None
+        self._request_counter = 0
+
+    def start(self) -> None:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            raise RuntimeError(
+                "hint vLLM cannot be spawned after torch.distributed.init_process_group: "
+                "workers inherit the trainer rendezvous and hang on TCPStore. Start the "
+                "hint engine before initializing the trainer process group."
+            )
+
+        from vllm import AsyncEngineArgs
+        from vllm.v1.engine.async_llm import AsyncLLM
+
+        engine_args = AsyncEngineArgs(
+            model=self.model,
+            dtype=self.config.model.dtype,
+            tensor_parallel_size=1,
+            distributed_executor_backend="uni",
+            gpu_memory_utilization=self.config.generator.engine.gpu_memory_utilization,
+            enforce_eager=False,
+            enable_prefix_caching=True,
+            max_model_len=min(8192, self.config.generator.engine.max_model_len),
+            seed=self.config.trainer.seed,
+        )
+        stripped = _torchrun_env_keys()
+        started = time.monotonic()
+        artifact_event(
+            "vllm",
+            "hint_engine_starting",
+            model=self.model,
+            gpu=self.config.generator.hint.gpu,
+            tensor_parallel_size=1,
+            stripped_torchrun_env=stripped,
+        )
+        try:
+            with pinned_visible_device(self.config.generator.hint.gpu):
+                with isolated_from_torchrun():
+                    logger.info(
+                        "starting hint engine on cuda:%d isolated from torchrun (stripped %s)",
+                        self.config.generator.hint.gpu,
+                        stripped or "nothing",
+                    )
+                    self.engine = AsyncLLM.from_engine_args(engine_args)
+        except Exception as exc:
+            artifact_event(
+                "vllm",
+                "hint_engine_start_failed",
+                model=self.model,
+                gpu=self.config.generator.hint.gpu,
+                elapsed_seconds=time.monotonic() - started,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        try:
+            self.tokenizer = self.engine.get_tokenizer()
+        except Exception:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model, trust_remote_code=True
+            )
+        logger.info("hint engine ready: %s on cuda:%d", self.model, self.config.generator.hint.gpu)
+        artifact_event(
+            "vllm",
+            "hint_engine_ready",
+            model=self.model,
+            gpu=self.config.generator.hint.gpu,
+            elapsed_seconds=time.monotonic() - started,
+        )
+
+    def _apply_chat_template(self, messages: list[dict]) -> str:
+        if self.tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model, trust_remote_code=True
+            )
+        kwargs = {"tokenize": False, "add_generation_prompt": True}
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages, enable_thinking=False, **kwargs
+            )
+        except TypeError:
+            return self.tokenizer.apply_chat_template(messages, **kwargs)
+
+    async def complete(self, system: str, user: str) -> str:
+        if self.engine is None:
+            raise RuntimeError("hint engine not started; call start() first")
+
+        from vllm import SamplingParams
+
+        prompt = self._apply_chat_template(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+        )
+        self._request_counter += 1
+        request_id = f"hint-{self._request_counter}-{uuid.uuid4().hex[:6]}"
+        started = time.monotonic()
+        artifact_event(
+            "vllm",
+            "hint_generation_started",
+            request_id=request_id,
+            model=self.model,
+            gpu=self.config.generator.hint.gpu,
+        )
+        sampling = SamplingParams(
+            temperature=0.0,
+            max_tokens=self.config.generator.hint.max_tokens,
+        )
+        final_output = None
+        try:
+            async for output in self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling,
+                request_id=request_id,
+            ):
+                final_output = output
+        except Exception as exc:
+            artifact_event(
+                "vllm",
+                "hint_generation_failed",
+                request_id=request_id,
+                elapsed_seconds=time.monotonic() - started,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        if final_output is None or not final_output.outputs:
+            artifact_event(
+                "vllm",
+                "hint_generation_failed",
+                request_id=request_id,
+                elapsed_seconds=time.monotonic() - started,
+                error_type="RuntimeError",
+                error="hint generation returned no output",
+            )
+            raise RuntimeError(f"no output for hint request {request_id}")
+        text = (final_output.outputs[0].text or "").strip()
+        artifact_event(
+            "vllm",
+            "hint_generation_succeeded",
+            request_id=request_id,
+            elapsed_seconds=time.monotonic() - started,
+            completion_tokens=len(final_output.outputs[0].token_ids),
+            finish_reason=getattr(final_output.outputs[0], "finish_reason", None),
+        )
+        return text
+
+    async def shutdown(self) -> None:
+        if self.engine is None:
+            return
+        self.engine.shutdown()
+        self.engine = None
+
+
 class VLLMRolloutEngine(InferenceEngine):
     """Async wrapper over vLLM's AsyncLLM for off-policy trajectory generation.
 

@@ -258,6 +258,28 @@ def test_weight_sync_port_falls_back_when_preferred_is_taken():
         holder.close()
 
 
+def test_assert_visible_gpus_refuses_a_two_gpu_box(monkeypatch):
+    import torch
+
+    from run import assert_visible_gpus
+    from train.config import Config
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    with pytest.raises(SystemExit, match="9-GPU"):
+        assert_visible_gpus(Config())
+
+
+def test_assert_visible_gpus_counts_cuda_visible_devices(monkeypatch):
+    from run import assert_visible_gpus
+    from train.config import Config
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    with pytest.raises(SystemExit, match="saw 2"):
+        assert_visible_gpus(Config())
+
+
 # ---- error-conditioned hint generation (no GPU, no network) ----
 
 def _task():
@@ -346,7 +368,8 @@ def test_hint_receives_the_configured_prompt_variant(monkeypatch):
     assert seen["prompt_variant"] == "answer_bearing"
     assert seen["response_text"] == "the draft text"
     assert seen["query"] == "Assess the funding base."
-    assert seen["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert seen["model"] == "Qwen/Qwen3.5-9B"
+    assert seen["backend"] == "openrouter"
     assert seen["max_retries"] == 5
     assert seen["max_tokens"] == 2048
     assert seen["reasoning_enabled"] is False
@@ -413,5 +436,130 @@ def test_mixture_not_ok_if_either_hint_empty(monkeypatch):
     assert hints.free == "FREE"
     assert hints.bearing == ""
     assert not hints.ok("mixture")
+
+
+class _StubHintEngine:
+    def __init__(self, text: str = "LOCAL HINT", fail: Exception | None = None) -> None:
+        self.text = text
+        self.fail = fail
+        self.calls: list[tuple[str, str]] = []
+
+    async def complete(self, system: str, user: str) -> str:
+        self.calls.append((system, user))
+        if self.fail is not None:
+            raise self.fail
+        return self.text
+
+
+def test_generate_hint_uses_local_engine(monkeypatch):
+    from conftest import make_config
+    from data.hint import generate_hint, set_hint_engine
+
+    engine = _StubHintEngine()
+    set_hint_engine(engine)
+    try:
+        hints = asyncio.run(
+            generate_hint(
+                make_config(
+                    error_hint_prompt="answer_free",
+                    error_hint_backend="vllm",
+                ),
+                _task(),
+                "draft",
+            )
+        )
+    finally:
+        set_hint_engine(None)
+    assert hints.free.endswith("LOCAL HINT\n")
+    assert hints.ok("answer_free")
+    assert engine.calls
+    assert "draft" in engine.calls[0][1]
+
+
+def test_local_hint_failure_drops_rollout():
+    from conftest import make_config
+    from data.hint import generate_hint
+
+    engine = _StubHintEngine(fail=RuntimeError("cuda oom"))
+    hints = asyncio.run(
+        generate_hint(
+            make_config(
+                error_hint_prompt="answer_free",
+                error_hint_backend="vllm",
+            ),
+            _task(),
+            "draft",
+            engine=engine,
+        )
+    )
+    assert hints.free == ""
+    assert not hints.ok("answer_free")
+    assert hints.cause == "vllm_error"
+    assert "cuda oom" in hints.detail
+
+
+def test_local_hint_timeout_is_classified():
+    from conftest import make_config
+    from data.hint import generate_hint
+
+    engine = _StubHintEngine(fail=TimeoutError("hint timed out"))
+    hints = asyncio.run(
+        generate_hint(
+            make_config(
+                error_hint_prompt="answer_free",
+                error_hint_backend="vllm",
+            ),
+            _task(),
+            "draft",
+            engine=engine,
+        )
+    )
+    assert hints.cause == "timeout"
+
+
+def test_gold_never_calls_hint_engine():
+    from conftest import make_config
+    from data.hint import generate_hint
+
+    class Boom:
+        async def complete(self, system: str, user: str) -> str:
+            raise AssertionError("gold must not call the hint engine")
+
+    hints = asyncio.run(
+        generate_hint(
+            make_config(
+                error_hint_prompt="gold",
+                error_hint_backend="vllm",
+            ),
+            _task(),
+            "transcript",
+            engine=Boom(),
+        )
+    )
+    assert hints.cause == "empty"
+    assert hints.free == ""
+
+
+def test_hint_engine_start_refuses_an_already_initialized_process_group(monkeypatch):
+    import torch.distributed as dist
+    from train.config import Config
+    from train.backends.vllm import HintEngine
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    engine = HintEngine(Config())
+    with pytest.raises(RuntimeError, match="cannot be spawned after"):
+        engine.start()
+
+
+def test_pinned_visible_device_restores_the_full_map(monkeypatch):
+    import os
+
+    from train.backends.vllm import pinned_visible_device
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7,8")
+    with pinned_visible_device(8):
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "8"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7,8"
 
 

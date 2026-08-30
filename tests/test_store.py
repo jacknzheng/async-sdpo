@@ -191,15 +191,17 @@ def test_hint_drop_percent_uses_all_attempts_and_tracks_cause():
         store.stats.count_hint_drop("openrouter_auth")
         store.stats.count_hint_drop("openrouter_rate_limit")
         store.stats.count_hint_drop("openrouter_length")
+        store.stats.count_hint_drop("vllm_error")
         return store.metrics()
 
     metrics = asyncio.run(run())
-    assert metrics["store_hint_attempted"] == 30.0
+    assert metrics["store_hint_attempted"] == 31.0
     assert metrics["store_hint_ok"] == 10.0
-    assert metrics["store_hint_dropped"] == 20.0
-    assert metrics["store_hint_dropped_percent"] == pytest.approx(2 / 3)
+    assert metrics["store_hint_dropped"] == 21.0
+    assert metrics["store_hint_dropped_percent"] == pytest.approx(21 / 31)
     assert metrics["hint_drop_openrouter_error"] == 16.0
     assert metrics["hint_drop_openrouter_credit"] == 1.0
     assert metrics["hint_drop_openrouter_auth"] == 1.0
     assert metrics["hint_drop_openrouter_rate_limit"] == 1.0
     assert metrics["hint_drop_openrouter_length"] == 1.0
+    assert metrics["hint_drop_vllm_error"] == 1.0

@@ -6,12 +6,33 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
+
 from train.config import Config
 from data.dataset import Task
 from data.diagnostics import artifact_event
 from reward.judge import chat_completion
 
 logger = logging.getLogger(__name__)
+
+
+class HintCompleter(Protocol):
+    """Duck-typed local hint backend. Tests stub this; production uses HintEngine."""
+
+    async def complete(self, system: str, user: str) -> str: ...
+
+
+_HINT_ENGINE: HintCompleter | None = None
+
+
+def set_hint_engine(engine: HintCompleter | None) -> None:
+    """Rank-0 installs the live HintEngine here so generate_hint never imports vLLM."""
+    global _HINT_ENGINE
+    _HINT_ENGINE = engine
+
+
+def _resolve_engine(engine: HintCompleter | None) -> HintCompleter | None:
+    return engine if engine is not None else _HINT_ENGINE
 
 @dataclass(frozen=True)
 class HintFailure:
@@ -64,8 +85,10 @@ def _format_rubric(sections: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _failure_from_exception(exc: BaseException) -> HintFailure:
-    """Classify an OpenRouter failure and retain a bounded, one-line diagnostic."""
+def _failure_from_exception(
+    exc: BaseException, *, backend: str = "openrouter"
+) -> HintFailure:
+    """Classify a hint-backend failure and retain a bounded, one-line diagnostic."""
     detail = " ".join(f"{type(exc).__name__}: {exc}".split())[:800]
     lower = detail.lower()
     if (
@@ -74,6 +97,8 @@ def _failure_from_exception(exc: BaseException) -> HintFailure:
         or "timed out" in lower
     ):
         cause = "timeout"
+    elif backend == "vllm":
+        cause = "vllm_error"
     elif (
         "insufficient credit" in lower
         or "insufficient credits" in lower
@@ -96,12 +121,14 @@ async def build_error_hint(
     sections: list[dict] | None = None,
     response_text: str = "",
     prompt_variant: str = "answer_free",
-    model: str = "nvidia/nemotron-3-super-120b-a12b:free",
+    model: str = "Qwen/Qwen3.5-9B",
     timeout: float = 90.0,
     max_retries: int = 5,
     max_tokens: int = 2048,
     reasoning_enabled: bool = False,
     user_prompt: str | None = None,
+    backend: str = "openrouter",
+    engine: HintCompleter | None = None,
 ) -> str:
     _hint_failure.set(None)
     if prompt_variant not in ERROR_HINT_PROMPTS:
@@ -109,6 +136,143 @@ async def build_error_hint(
             f"unknown hint prompt {prompt_variant!r}; choose from {sorted(ERROR_HINT_PROMPTS)}"
         )
 
+    if user_prompt is None:
+        user_prompt = (
+            f"<question>\n{query}\n</question>\n\n"
+            f"<rubric>\n{_format_rubric(sections or [])}\n</rubric>\n\n"
+            f"<draft_answer>\n{response_text}\n</draft_answer>"
+        )
+
+    if backend == "vllm":
+        generated = await _complete_local_hint(
+            ERROR_HINT_PROMPTS[prompt_variant],
+            user_prompt,
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            prompt_variant=prompt_variant,
+            query=query,
+            response_text=response_text,
+            engine=engine,
+        )
+    else:
+        generated = await _complete_openrouter_hint(
+            ERROR_HINT_PROMPTS[prompt_variant],
+            user_prompt,
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+            reasoning_enabled=reasoning_enabled,
+            prompt_variant=prompt_variant,
+            query=query,
+            response_text=response_text,
+        )
+
+    if not generated:
+        return ""
+    if prompt_variant == "step_hint":
+        return generated
+    return f"Guidance for answering this question:\n{generated}\n"
+
+
+async def _complete_local_hint(
+    system: str,
+    user_prompt: str,
+    *,
+    model: str,
+    timeout: float,
+    max_retries: int,
+    prompt_variant: str,
+    query: str,
+    response_text: str,
+    engine: HintCompleter | None,
+) -> str:
+    completer = _resolve_engine(engine)
+    if completer is None:
+        failure = HintFailure(
+            cause="vllm_error",
+            detail="hint engine is not started",
+        )
+        _hint_failure.set(failure)
+        logger.warning(
+            "error-hint generation failed (variant=%s, cause=%s, detail=%s)",
+            prompt_variant,
+            failure.cause,
+            failure.detail,
+        )
+        artifact_event(
+            "api_failures",
+            "hint_generation_failed",
+            provider="vllm",
+            operation="hint_generation",
+            model=model,
+            prompt_variant=prompt_variant,
+            cause=failure.cause,
+            error=failure.detail,
+            query=query,
+        )
+        return ""
+
+    last_failure: HintFailure | None = None
+    for attempt in range(max_retries):
+        try:
+            generated = await asyncio.wait_for(
+                completer.complete(system, user_prompt),
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 -- a hint failure must never break a rollout
+            last_failure = _failure_from_exception(exc, backend="vllm")
+            logger.warning(
+                "error-hint generation failed (variant=%s, attempt=%d, cause=%s, detail=%s)",
+                prompt_variant,
+                attempt + 1,
+                last_failure.cause,
+                last_failure.detail,
+            )
+            continue
+        generated = generated.strip()
+        if generated:
+            return generated
+        last_failure = HintFailure(
+            cause="empty",
+            detail="local hint engine returned empty hint content",
+        )
+        break
+
+    failure = last_failure or HintFailure(
+        cause="vllm_error",
+        detail="local hint engine returned no content",
+    )
+    _hint_failure.set(failure)
+    artifact_event(
+        "api_failures",
+        "hint_generation_failed",
+        provider="vllm",
+        operation="hint_generation",
+        model=model,
+        prompt_variant=prompt_variant,
+        cause=failure.cause,
+        error=failure.detail,
+        query=query,
+        response_text=response_text,
+    )
+    return ""
+
+
+async def _complete_openrouter_hint(
+    system: str,
+    user_prompt: str,
+    *,
+    model: str,
+    timeout: float,
+    max_retries: int,
+    max_tokens: int,
+    reasoning_enabled: bool,
+    prompt_variant: str,
+    query: str,
+    response_text: str,
+) -> str:
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         _hint_failure.set(
@@ -131,16 +295,9 @@ async def build_error_hint(
         )
         return ""
 
-    if user_prompt is None:
-        user_prompt = (
-            f"<question>\n{query}\n</question>\n\n"
-            f"<rubric>\n{_format_rubric(sections or [])}\n</rubric>\n\n"
-            f"<draft_answer>\n{response_text}\n</draft_answer>"
-        )
-
     try:
         generated = await chat_completion(
-            ERROR_HINT_PROMPTS[prompt_variant],
+            system,
             user_prompt,
             model=model,
             api_key=api_key,
@@ -150,7 +307,7 @@ async def build_error_hint(
             reasoning_enabled=reasoning_enabled,
         )
     except Exception as exc:  # noqa: BLE001 -- a hint failure must never break a rollout
-        failure = _failure_from_exception(exc)
+        failure = _failure_from_exception(exc, backend="openrouter")
         _hint_failure.set(failure)
         logger.warning(
             "error-hint generation failed (variant=%s, cause=%s, detail=%s)",
@@ -193,9 +350,7 @@ async def build_error_hint(
             response_text=response_text,
         )
         return ""
-    if prompt_variant == "step_hint":
-        return generated
-    return f"Guidance for answering this question:\n{generated}\n"
+    return generated
 
 # initialize hint rate limiter to None
 _HINT_SEM: asyncio.Semaphore | None = None
@@ -217,8 +372,24 @@ def _failure_for(text: str) -> HintFailure | None:
     )
 
 
+def _hint_kwargs(config: Config, engine: HintCompleter | None = None) -> dict:
+    return {
+        "model": config.generator.hint.model,
+        "timeout": config.generator.hint.timeout,
+        "max_retries": config.generator.hint.max_retries,
+        "max_tokens": config.generator.hint.max_tokens,
+        "reasoning_enabled": config.generator.hint.reasoning_enabled,
+        "backend": config.generator.hint.backend,
+        "engine": engine,
+    }
+
+
 async def _one_hint(
-    config: Config, task: Task, response_text: str, variant: str
+    config: Config,
+    task: Task,
+    response_text: str,
+    variant: str,
+    engine: HintCompleter | None = None,
 ) -> tuple[str, HintFailure | None]:
     async with _hint_sem(config.generator.hint.concurrency):
         text = await build_error_hint(
@@ -226,16 +397,17 @@ async def _one_hint(
             sections=task.sections,
             response_text=response_text,
             prompt_variant=variant,
-            model=config.generator.hint.model,
-            timeout=config.generator.hint.timeout,
-            max_retries=config.generator.hint.max_retries,
-            max_tokens=config.generator.hint.max_tokens,
-            reasoning_enabled=config.generator.hint.reasoning_enabled,
+            **_hint_kwargs(config, engine),
         )
     return text, _failure_for(text)
 
 
-async def generate_hint(config: Config, task: Task, response_text: str) -> Hints:
+async def generate_hint(
+    config: Config,
+    task: Task,
+    response_text: str,
+    engine: HintCompleter | None = None,
+) -> Hints:
     mode = config.generator.hint.prompt
     try:
         if mode == "gold":
@@ -253,11 +425,7 @@ async def generate_hint(config: Config, task: Task, response_text: str) -> Hints
                         f"<gold>\n{gold_material(task)}\n</gold>\n\n"
                         f"<transcript>\n{response_text}\n</transcript>"
                     ),
-                    model=config.generator.hint.model,
-                    timeout=config.generator.hint.timeout,
-                    max_retries=config.generator.hint.max_retries,
-                    max_tokens=config.generator.hint.max_tokens,
-                    reasoning_enabled=config.generator.hint.reasoning_enabled,
+                    **_hint_kwargs(config, engine),
                 )
             failure = _failure_for(text)
             return Hints(
@@ -267,8 +435,8 @@ async def generate_hint(config: Config, task: Task, response_text: str) -> Hints
             )
         if mode == "mixture":
             (free, free_failure), (bearing, bearing_failure) = await asyncio.gather(
-                _one_hint(config, task, response_text, "answer_free"),
-                _one_hint(config, task, response_text, "answer_bearing"),
+                _one_hint(config, task, response_text, "answer_free", engine),
+                _one_hint(config, task, response_text, "answer_bearing", engine),
             )
             failure = free_failure or bearing_failure
             return Hints(
@@ -279,14 +447,14 @@ async def generate_hint(config: Config, task: Task, response_text: str) -> Hints
             )
         if mode == "answer_bearing":
             text, failure = await _one_hint(
-                config, task, response_text, "answer_bearing"
+                config, task, response_text, "answer_bearing", engine
             )
             return Hints(
                 bearing=text,
                 cause=failure.cause if failure else "",
                 detail=failure.detail if failure else "",
             )
-        text, failure = await _one_hint(config, task, response_text, "answer_free")
+        text, failure = await _one_hint(config, task, response_text, "answer_free", engine)
         return Hints(
             free=text,
             cause=failure.cause if failure else "",
@@ -294,5 +462,5 @@ async def generate_hint(config: Config, task: Task, response_text: str) -> Hints
         )
     except Exception as exc:
         logger.exception("error-hint failed for task %s", task.task_id)
-        failure = _failure_from_exception(exc)
+        failure = _failure_from_exception(exc, backend=config.generator.hint.backend)
         return Hints(cause="other", detail=failure.detail)

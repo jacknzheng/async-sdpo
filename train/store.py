@@ -20,6 +20,7 @@ class StoreStats:
     hint_drop_openrouter_error: int = 0
     hint_drop_timeout: int = 0
     hint_drop_empty: int = 0
+    hint_drop_vllm_error: int = 0
     hint_drop_parse_fail: int = 0
     hint_drop_other: int = 0
     staleness_histogram: Counter[int] = field(default_factory=Counter)
@@ -60,6 +61,7 @@ class StoreStats:
             "hint_drop_openrouter_error": float(self.hint_drop_openrouter_error),
             "hint_drop_timeout": float(self.hint_drop_timeout),
             "hint_drop_empty": float(self.hint_drop_empty),
+            "hint_drop_vllm_error": float(self.hint_drop_vllm_error),
             "hint_drop_parse_fail": float(self.hint_drop_parse_fail),
             "hint_drop_other": float(self.hint_drop_other),
         }

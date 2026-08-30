@@ -41,6 +41,9 @@ def make_config(**overrides) -> Config:
         "weight_sync_bucket_mb": "generator.engine.weight_sync_bucket_mb",
         # generator.hint
         "error_hint_prompt": "generator.hint.prompt",
+        "error_hint_backend": "generator.hint.backend",
+        "error_hint_model": "generator.hint.model",
+        "error_hint_gpu": "generator.hint.gpu",
         "error_hint_concurrency": "generator.hint.concurrency",
         "error_hint_max_tokens": "generator.hint.max_tokens",
         "error_hint_reasoning_enabled": "generator.hint.reasoning_enabled",
@@ -56,4 +59,7 @@ def make_config(**overrides) -> Config:
     # of 2 is valid without every call site repeating n_trainer_gpus=1.
     if "n_trainer_gpus" not in overrides:
         overrides = {**overrides, "n_trainer_gpus": 1}
+    # Offline tests stub OpenRouter; do not reserve the ninth hint GPU.
+    if "error_hint_backend" not in overrides:
+        overrides = {**overrides, "error_hint_backend": "openrouter"}
     return Config.from_cli_overrides([f"{dotted[k]}={v}" for k, v in overrides.items()])
