@@ -9,8 +9,8 @@ tool-using evals:
 - **DiligenceBench** — [`paperinstruments/diligence-bench`](https://huggingface.co/datasets/paperinstruments/diligence-bench).
   Multi-turn TIR with Parallel `web_search`, scored by a rubric judge (eval only).
 
-Launch with the scripts in `scripts/`. Do not start from a raw `python run.py` on a
-9-GPU box unless you are iterating on a one-off override.
+Launch with the scripts in `scripts/`. Do not start from a raw `python run.py` on an
+8-GPU box unless you are iterating on a one-off override.
 
 ## What SDPO is, in plain terms
 
@@ -76,13 +76,13 @@ The paper proves the baseline term vanishes identically; whitening would destroy
 because unlike GRPO's relative advantages the _absolute sign_ here means "teacher agrees /
 disagrees" and is the entire point.
 
-## Run it (9 GPUs)
+## Run it (8 GPUs)
 
-Default stack: `Qwen/Qwen3-8B`, 4 vLLM rollout GPUs + 4 FSDP2 trainer ranks + 1
-frozen hint GPU (`Qwen/Qwen3.5-9B` on `cuda:8`), max staleness K=3,
+Default stack: `Qwen/Qwen3-8B`, 4 vLLM rollout GPUs + 3 FSDP2 trainer ranks + 1
+frozen hint GPU (`Qwen/Qwen3.5-9B` on `cuda:7`), max staleness K=3,
 `vllm==0.26.x` and `torch==2.11.0+cu128` pinned exactly. Python 3.12.
-Request a 9-GPU box. The operator default of 2 is not enough; startup exits if
-fewer than 9 devices are visible. Do not shrink to 3+4+1 or 1+1.
+Request an 8-GPU box. The operator default of 2 is not enough; startup exits if
+fewer than 8 devices are visible. Do not colocate hints on the rollout engine.
 Do not let uv pull torch 2.13 (CUDA 13) — it will not load on a 12.8 driver.
 
 ### Secrets
@@ -141,7 +141,7 @@ bash scripts/run_diligencebench.sh smoke
 bash scripts/run_taubench.sh baseline
 bash scripts/run_diligencebench.sh baseline
 
-# Training ablations (one 9-GPU box per arm is the intended fleet).
+# Training ablations (one 8-GPU box per arm is the intended fleet).
 bash scripts/run_taubench.sh gold
 bash scripts/run_taubench.sh step_hint
 bash scripts/run_taubench.sh gold_banking
@@ -165,14 +165,14 @@ evaluation is neither skipped nor mislabeled after later weight updates.
 `tau2-sandbox-setup-*.log`. Checkpoints go to `runs/sdpo-tau2/` or
 `runs/sdpo-diligence/`. Wandb projects: `sdpo-tau2` / `sdpo-diligence`.
 
-The real run is `torchrun --nproc-per-node=4` (one process per trainer GPU). Rank 0 owns
-rollout, the hint engine, the store, eval, and wandb; ranks 1–3 only train. `--smoke` and
+The real run is `torchrun --nproc-per-node=3` (one process per trainer GPU). Rank 0 owns
+rollout, the hint engine, the store, eval, and wandb; ranks 1–2 only train. `--smoke` and
 `--baseline` are single-process and skip the local hint engine (`backend=openrouter`).
 
 Rank 0 starts the hint engine (when the prompt needs an LLM) and then the rollout
 engine *before* `init_process_group`, with torchrun/elastic env vars stripped for the
 spawn. Hint spawn temporarily sets `CUDA_VISIBLE_DEVICES` to the hint GPU, then
-restores the full `0-8` map. Otherwise the TP=4 workers inherit `WORLD_SIZE=4` and hang
+restores the full `0-7` map. Otherwise the TP=4 workers inherit `WORLD_SIZE=3` and hang
 on torchrun's TCPStore (`127.0.0.1:<port>` timeout) instead of forming their own — that
 is the Baseten 4+4 failure. Do not move either `start()` to after the trainer group
 joins.
@@ -253,8 +253,8 @@ restored weights into vLLM before any new rollout starts.
 | Setting            | Value                             | Notes                       |
 | ------------------ | --------------------------------- | --------------------------- |
 | model              | `Qwen/Qwen3-8B`                   | smoke: `Qwen/Qwen3-0.6B`    |
-| GPUs               | 4 rollout / 4 trainer / 1 hint    | 9-GPU request; see below    |
-| batch / mini-batch | 16 / 2                            | proven 4+4 memory setting   |
+| GPUs               | 4 rollout / 3 trainer / 1 hint    | 8-GPU box; see below        |
+| batch / mini-batch | 18 / 2                            | 18 divisible by 3 ranks     |
 | max staleness K    | 3                                 | blog + confirmed            |
 | clip window        | `clip(r, 0.8, 1.4)`               | must contain 1.0            |
 | advantage clip     | 3.0x EMA (decay 0.99)             | blog (3x); EMA spec is ours |
@@ -265,9 +265,9 @@ restored weights into vLLM before any new rollout starts.
 
 **GPU split.** Rollout GPUs come first (vLLM's multiprocess workers pick `cuda:0..TP-1`
 by worker index); each trainer rank pins `cuda:{n_rollout_gpus + rank}`; the frozen hint
-engine sits on `cuda:{generator.hint.gpu}` (default 8). The proven 4+4 policy/trainer
-split is unchanged; the ninth GPU is only for hints. Startup fails if
-`torch.cuda.device_count()` is below the reserved count (9 with `hint.backend=vllm`).
+engine sits on `cuda:{generator.hint.gpu}` (default 7). Policy keeps TP=4; one
+trainer rank is traded for the hint GPU. Startup fails if
+`torch.cuda.device_count()` is below the reserved count (8 with `hint.backend=vllm`).
 The proven workstation default is 8B (~16 GB weights + 16 GB grads + 33 GB Adam ≈ 65 GB, hence
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`). 27B remains available via
 `model.model=Qwen/Qwen3.8-27B`, but its vLLM TP=4 custom all-reduce requires GPU P2P/IPC,
@@ -277,7 +277,7 @@ and `lm_head` stay replicated — the packed logprob path calls those submodules
 and a sharded `embed_tokens` crashes with mixed Tensor/DTensor.
 The hinted **teacher forward** still shares the trainer GPUs: it is the same weights as
 the student, run under `no_grad` on each trainer rank. The **hint LLM** is a separate
-frozen `Qwen/Qwen3.5-9B` on `cuda:8` and does not receive weight sync.
+frozen `Qwen/Qwen3.5-9B` on `cuda:7` and does not receive weight sync.
 
 **Clip window.** The IS ratio `r = π_current/π_rollout` is centered at **1.0**, so the
 window must contain 1.0 — a `[1.2, 1.4]` window would clip every _unchanged_ token. `1.4`
@@ -301,7 +301,7 @@ for the first ~100 steps — exactly when training is least stable.
 ## Hints are error-conditioned
 
 On diligence (and tau2 `step_hint`), every hint is written **per rollout** by a
-frozen local `Qwen/Qwen3.5-9B` on `cuda:8`, which reads the draft the student
+frozen local `Qwen/Qwen3.5-9B` on `cuda:7`, which reads the draft the student
 actually produced. Diligence judge and tau2 user-sim stay on OpenRouter
 (`nvidia/nemotron-3-super-120b-a12b:free`). Set
 `generator.hint.backend=openrouter` to send hints back to OpenRouter.

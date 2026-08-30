@@ -46,22 +46,26 @@ def test_answer_free_uses_local_hint_engine():
 def test_default_split_uses_the_whole_box():
     cfg = Config()
     assert cfg.generator.engine.n_rollout_gpus == 4
-    assert cfg.trainer.n_trainer_gpus == 4
+    assert cfg.trainer.n_trainer_gpus == 3
     assert cfg.generator.hint.backend == "vllm"
-    assert cfg.generator.hint.gpu == 8
-    assert cfg.total_num_gpus == 9
-    assert cfg.reserved_gpus() == 9
+    assert cfg.generator.hint.gpu == 7
+    assert cfg.total_num_gpus == 8
+    assert cfg.reserved_gpus() == 8
 
 
-def test_vllm_hint_on_eight_gpus_rejected():
-    with pytest.raises(ValueError, match="<= 8"):
-        Config.from_cli_overrides(["total_num_gpus=8"])
+def test_vllm_hint_on_seven_gpus_rejected():
+    with pytest.raises(ValueError, match="<= 7"):
+        Config.from_cli_overrides(["total_num_gpus=7"])
 
 
 def test_gpu_split_over_capacity_rejected():
     with pytest.raises(ValueError, match="<="):
         Config.from_cli_overrides(
-            ["generator.engine.n_rollout_gpus=8", "trainer.n_trainer_gpus=4"]
+            [
+                "generator.engine.n_rollout_gpus=8",
+                "trainer.n_trainer_gpus=3",
+                "trainer.batch_size=18",
+            ]
         )
 
 
@@ -133,13 +137,14 @@ def test_default_is_proven_tau2_8b_stack():
     assert cfg.model.model == "Qwen/Qwen3-8B"
     assert cfg.trainer.gradient_checkpointing is True
     assert cfg.trainer.mini_batch_size == 2
-    assert cfg.trainer.batch_size == 16
+    assert cfg.trainer.batch_size == 18
+    assert cfg.trainer.n_trainer_gpus == 3
     assert cfg.generator.engine.max_model_len == 16384
     assert cfg.generator.engine.disable_custom_all_reduce is True
     assert cfg.generator.hint.prompt == "gold"
     assert cfg.generator.hint.backend == "vllm"
     assert cfg.generator.hint.model == "Qwen/Qwen3.5-9B"
-    assert cfg.generator.hint.gpu == 8
+    assert cfg.generator.hint.gpu == 7
     assert cfg.generator.hint.max_tokens == 2048
     assert cfg.generator.hint.reasoning_enabled is False
     assert (

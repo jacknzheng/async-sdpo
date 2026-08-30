@@ -131,7 +131,7 @@ def pinned_visible_device(gpu: int) -> Iterator[None]:
     """Restrict CUDA_VISIBLE_DEVICES to one physical index for a spawn, then restore.
 
     Must wrap the call that forks hint-engine workers, and must run before the parent
-    initializes CUDA. Restore the full 0-8 map before trainer / rollout CUDA init so
+    initializes CUDA. Restore the full 0-7 map before trainer / rollout CUDA init so
     those processes still see every device.
     """
     saved = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -149,7 +149,7 @@ class HintEngine:
     """Frozen one-GPU vLLM for error-conditioned hints. No weight sync.
 
     Not an InferenceEngine: it never joins the NCCL transfer group and never sees
-    trainer weights. Lives on cuda:{hint.gpu} (default 8) for the life of the run.
+    trainer weights. Lives on cuda:{hint.gpu} (default 7) for the life of the run.
     """
 
     def __init__(self, config: Config) -> None:

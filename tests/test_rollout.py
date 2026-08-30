@@ -267,7 +267,7 @@ def test_assert_visible_gpus_refuses_a_two_gpu_box(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
-    with pytest.raises(SystemExit, match="9-GPU"):
+    with pytest.raises(SystemExit, match="8-GPU"):
         assert_visible_gpus(Config())
 
 
@@ -557,9 +557,9 @@ def test_pinned_visible_device_restores_the_full_map(monkeypatch):
 
     from train.backends.vllm import pinned_visible_device
 
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7,8")
-    with pinned_visible_device(8):
-        assert os.environ["CUDA_VISIBLE_DEVICES"] == "8"
-    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7,8"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    with pinned_visible_device(7):
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "7"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
 
 

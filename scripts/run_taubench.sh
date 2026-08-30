@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tau-bench SDPO on 9 GPUs (4 vLLM rollout + 4 FSDP trainer + 1 hint).
+# Tau-bench SDPO on 8 GPUs (4 vLLM rollout + 3 FSDP trainer + 1 hint).
 #
 # Usage:
 #   bash scripts/run_taubench.sh <mode> [extra dotted overrides...]
@@ -18,7 +18,7 @@
 #   bash scripts/run_taubench.sh step_hint trainer.total_steps=200
 #   bash scripts/run_taubench.sh baseline
 #
-# Needs: 9 GPUs (4+4+1), OPENROUTER_API_KEY (tau2 user sim), WANDB_API_KEY,
+# Needs: 8 GPUs (4+3+1), OPENROUTER_API_KEY (tau2 user sim), WANDB_API_KEY,
 #        `uv sync --extra knowledge`, `bash scripts/setup_tau2_sandbox.sh`
 #        `which` is not enough — bwrap must be able to create namespaces
 #        (--privileged / seccomp=unconfined). run.py probes this and exits.
@@ -53,12 +53,12 @@ mkdir -p "${LOG_ROOT}/${RUN}" || {
   mkdir -p "${LOG_ROOT}/${RUN}"
 }
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export WANDB_PROJECT="${WANDB_PROJECT:-sdpo-tau2}"
 
-NPROC=4
+NPROC=3
 EXTRA=()
 case "$MODE" in
   gold)

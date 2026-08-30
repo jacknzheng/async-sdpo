@@ -127,8 +127,8 @@ class HintConfig(BaseConfig):
     # Frozen one-GPU vLLM by default. openrouter remains an explicit fallback.
     backend: str = "vllm"
     model: str = "Qwen/Qwen3.5-9B"
-    # Last visible device on the 4+4+1 / 9-GPU map (cuda:8).
-    gpu: int = 8
+    # Last visible device on the 4+3+1 / 8-GPU map (cuda:7).
+    gpu: int = 7
     concurrency: int = 4
     timeout: float = 90.0
     max_retries: int = 5
@@ -255,8 +255,8 @@ class TrainerConfig(BaseConfig):
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 
-    n_trainer_gpus: int = 4
-    batch_size: int = 16             # divisible by 4
+    n_trainer_gpus: int = 3
+    batch_size: int = 18             # divisible by 3
     eval_batch_size: int = 16
     mini_batch_size: int = 2
 
@@ -335,7 +335,7 @@ class LoggingConfig(BaseConfig):
     # Path to state.pt, its step directory, or "latest" under output_dir.
     resume_from: str | None = None
     # Rank-0 writes train.log / args.txt / config.yaml here. Default `/log` on the
-    # 9-GPU box; falls back to ./log if that path is not writable.
+    # 8-GPU box; falls back to ./log if that path is not writable.
     log_dir: str = "/log"
     run_name: str = ""
     wandb_project: str = "sdpo-tau2"
@@ -352,7 +352,7 @@ class Config(BaseConfig):
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
-    total_num_gpus: int = 9
+    total_num_gpus: int = 8
     num_workers: int = 4 * total_num_gpus
 
     def reserved_gpus(self) -> int:

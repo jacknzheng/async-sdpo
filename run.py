@@ -531,9 +531,9 @@ def _pick_weight_sync_port(host: str, preferred: int) -> int:
 
 
 def assert_visible_gpus(config: Config) -> None:
-    """Refuse to start if the box is smaller than the reserved 4+4+1 map.
+    """Refuse to start if the box is smaller than the reserved 4+3+1 map.
 
-    The operator default is 2 GPUs. This job requests 9 and does not degrade.
+    The operator default is 2 GPUs. This job requests 8 and does not degrade.
     """
     required = config.reserved_gpus()
     env_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -561,8 +561,8 @@ def assert_visible_gpus(config: Config) -> None:
         f"need {required} visible GPUs "
         f"({config.generator.engine.n_rollout_gpus} rollout + "
         f"{config.trainer.n_trainer_gpus} trainer{hint}); saw {visible}. "
-        "Operator default of 2 is not enough; request a 9-GPU box "
-        "(4 rollout + 4 trainer + 1 hint). Do not shrink to 3+4+1 or 1+1.\n"
+        "Operator default of 2 is not enough; request an 8-GPU box "
+        "(4 rollout + 3 trainer + 1 hint). Do not colocate hints or use NPROC=1.\n"
         f"{nvidia}"
     )
 
