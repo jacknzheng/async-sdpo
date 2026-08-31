@@ -161,7 +161,7 @@ def test_default_is_proven_tau2_8b_stack():
     assert cfg.generator.engine.disable_custom_all_reduce is True
     assert cfg.generator.hint.prompt == "gold"
     assert cfg.generator.hint.backend == "openrouter"
-    assert cfg.generator.hint.model == "deepseek/deepseek-v4-flash-latest"
+    assert cfg.generator.hint.model == "deepseek/deepseek-v4-flash"
     assert cfg.generator.hint.max_tokens == 2048
     assert cfg.generator.hint.reasoning_enabled is False
     assert (

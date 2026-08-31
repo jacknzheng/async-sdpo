@@ -79,7 +79,7 @@ disagrees" and is the entire point.
 ## Run it (8 GPUs)
 
 Default stack: `Qwen/Qwen3-8B`, 4 vLLM rollout GPUs + 4 FSDP2 trainer ranks,
-OpenRouter hints (`deepseek/deepseek-v4-flash-latest`), max staleness K=3,
+OpenRouter hints (`deepseek/deepseek-v4-flash`), max staleness K=3,
 `vllm==0.26.x` and `torch==2.11.0+cu128` pinned exactly. Python 3.12.
 Request an 8-GPU box. The operator default of 2 is not enough; startup exits if
 fewer than 8 devices are visible. Do not colocate hints on the rollout engine.
@@ -274,7 +274,7 @@ and `lm_head` stay replicated — the packed logprob path calls those submodules
 and a sharded `embed_tokens` crashes with mixed Tensor/DTensor.
 The hinted **teacher forward** still shares the trainer GPUs: it is the same weights as
 the student, run under `no_grad` on each trainer rank. The **hint LLM** is a separate
-OpenRouter call (`deepseek/deepseek-v4-flash-latest`) and does not share policy weights.
+OpenRouter call (`deepseek/deepseek-v4-flash`) and does not share policy weights.
 Set `generator.hint.backend=vllm` to run a frozen one-GPU hinter instead.
 
 **Clip window.** The IS ratio `r = π_current/π_rollout` is centered at **1.0**, so the
@@ -299,7 +299,7 @@ for the first ~100 steps — exactly when training is least stable.
 ## Hints are error-conditioned
 
 On diligence (and tau2 `step_hint`), every hint is written **per rollout** by
-OpenRouter `deepseek/deepseek-v4-flash-latest`, which reads the draft the student
+OpenRouter `deepseek/deepseek-v4-flash`, which reads the draft the student
 actually produced. Diligence judge and tau2 user-sim stay on
 `nvidia/nemotron-3-super-120b-a12b:free`. Set `generator.hint.backend=vllm` to
 run a frozen local hinter instead.

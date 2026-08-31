@@ -126,7 +126,7 @@ class HintConfig(BaseConfig):
     prompt: str = "gold"
     # OpenRouter by default. backend=vllm still starts a frozen one-GPU hinter.
     backend: str = "openrouter"
-    model: str = "deepseek/deepseek-v4-flash-latest"
+    model: str = "deepseek/deepseek-v4-flash"
     # Only used when backend=vllm. Last unused device on an 8-GPU 4+3+1 map.
     gpu: int = 7
     concurrency: int = 4

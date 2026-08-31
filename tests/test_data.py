@@ -233,7 +233,7 @@ def _build(prompt_variant="answer_free"):
             response_text=DRAFT,
             prompt_variant=prompt_variant,
             backend="openrouter",
-            model="deepseek/deepseek-v4-flash-latest",
+            model="deepseek/deepseek-v4-flash",
         )
     )
 
@@ -297,7 +297,7 @@ def test_hint_request_sends_no_response_format(monkeypatch):
     sent = _stub_openrouter(monkeypatch, "- how deposit cost trended against balances")
     _build("answer_free")
     payload = json.loads(sent[0]["data"])
-    assert payload["model"] == "deepseek/deepseek-v4-flash-latest"
+    assert payload["model"] == "deepseek/deepseek-v4-flash"
     assert "response_format" not in payload
     assert "provider" not in payload
     assert payload["temperature"] == 0.0
