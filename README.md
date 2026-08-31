@@ -91,7 +91,7 @@ Put a gitignored `.env` at the repo root (`run.py` loads it before anything that
 keys). Never commit it.
 
 ```bash
-OPENROUTER_API_KEY=...   # hints (DeepSeek), diligence judge, tau2 user sim
+OPENROUTER_API_KEY=...   # hints + tau2 user sim (DeepSeek), diligence judge
 WANDB_API_KEY=...
 HF_TOKEN=...             # model download
 PARALLEL_API_KEY=...     # diligence web_search only
@@ -300,7 +300,8 @@ for the first ~100 steps — exactly when training is least stable.
 
 On diligence (and tau2 `step_hint`), every hint is written **per rollout** by
 OpenRouter `deepseek/deepseek-v4-flash`, which reads the draft the student
-actually produced. Diligence judge and tau2 user-sim stay on
+actually produced. Tau2 user-sim is the same DeepSeek slug
+(`openrouter/deepseek/deepseek-v4-flash`). Diligence judge stays on
 `nvidia/nemotron-3-super-120b-a12b:free`. Set `generator.hint.backend=vllm` to
 run a frozen local hinter instead.
 Two rollouts of the same task get different hints. Tau2 `gold` skips the LLM and injects

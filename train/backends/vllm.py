@@ -599,7 +599,7 @@ class VLLMRolloutEngine(InferenceEngine):
             )
 
         if task.domain:
-            from data.tau_harness import run_tau2_episode
+            from data.tau_harness import default_user_llm_args, run_tau2_episode
 
             episode = await run_tau2_episode(
                 task,
@@ -607,6 +607,7 @@ class VLLMRolloutEngine(InferenceEngine):
                 encode=self.encode_text,
                 tokenize_chat=self.tokenize_chat,
                 user_llm=self.config.data.user_llm,
+                user_llm_args=default_user_llm_args(),
                 retrieval=self.config.data.retrieval,
                 max_steps=self.config.generator.max_steps,
             )

@@ -165,8 +165,7 @@ def test_default_is_proven_tau2_8b_stack():
     assert cfg.generator.hint.max_tokens == 2048
     assert cfg.generator.hint.reasoning_enabled is False
     assert (
-        cfg.data.user_llm
-        == "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+        cfg.data.user_llm == "openrouter/deepseek/deepseek-v4-flash"
     )
     assert cfg.judge.model == "nvidia/nemotron-3-super-120b-a12b:free"
     assert cfg.judge.reasoning_enabled is False

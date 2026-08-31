@@ -217,10 +217,6 @@ def init_wandb(config: Config, ctx: RunContext):
             dir=str(ctx.log_dir),
             notes=ctx.cli,
         )
-        # Eval runs asynchronously and may finish after training has advanced.
-        # Give eval its own x-axis instead of attempting an out-of-order global step.
-        run.define_metric("eval/launched_at_step")
-        run.define_metric("eval/*", step_metric="eval/launched_at_step")
     except Exception:
         logging.getLogger("sdpo").exception(
             "wandb.init failed; continuing with file logs only"
@@ -367,6 +363,7 @@ async def evaluate_pass1(
     overall: list[float] = []
     by_domain: dict[str, list[float]] = defaultdict(list)
     rollout_errors = 0
+    rows: list[list] = []
     for task, outcome in zip(tasks, results):
         if isinstance(outcome, BaseException):
             rollout_errors += 1
@@ -406,6 +403,9 @@ async def evaluate_pass1(
         overall.append(score)
         domain = getattr(task, "domain", None) or "unknown"
         by_domain[domain].append(score)
+        rows.append(
+            [task.task_id, domain, score, getattr(task, "query", ""), result.text]
+        )
         artifact_event(
             "evaluations",
             "evaluation_task_completed",
@@ -433,6 +433,7 @@ async def evaluate_pass1(
     for domain, scores in sorted(by_domain.items()):
         metrics[f"pass1_{domain}"] = _mean(scores)
         metrics[f"n_{domain}"] = float(len(scores))
+    metrics["_eval_rows"] = rows
     return metrics
 
 
@@ -444,6 +445,7 @@ async def evaluate_and_log(
     policy_version: int,
     dataset: str = "diligence",
     max_concurrency: int = 8,
+    phase: str = "interval",
 ) -> dict[str, float] | None:
     """Evaluate one frozen policy version and persist aggregate results."""
     started = time.monotonic()
@@ -473,16 +475,25 @@ async def evaluate_and_log(
                 launched_at_step=step,
                 policy_version=policy_version,
             )
-        logger.info("EVAL launched at step %d (policy %d): %s", step, policy_version, metrics)
+        logger.info(
+            "EVAL %s launched at step %d (policy %d): %s",
+            phase,
+            step,
+            policy_version,
+            {k: v for k, v in metrics.items() if k != "_eval_rows"},
+        )
+        rows = metrics.pop("_eval_rows", None)
         payload = {f"eval/{k}": v for k, v in metrics.items()}
         payload["eval/launched_at_step"] = float(step)
         payload["eval/policy_version"] = float(policy_version)
+        payload["eval/phase"] = phase
         artifact_event(
             "evaluations",
             "evaluation_completed",
             dataset=dataset,
             launched_at_step=step,
             policy_version=policy_version,
+            phase=phase,
             elapsed_seconds=time.monotonic() - started,
             metrics=metrics,
         )
@@ -491,7 +502,12 @@ async def evaluate_and_log(
         except ImportError:
             return metrics
         if wandb.run is not None:
-            wandb.log(payload)
+            if rows:
+                payload["eval/tasks"] = wandb.Table(
+                    columns=["task_id", "domain", "pass1", "query", "output"],
+                    data=rows,
+                )
+            wandb.log(payload, step=step)
         return metrics
     except Exception as exc:
         logger.exception("eval failed (launched at step %d)", step)

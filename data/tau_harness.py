@@ -7,6 +7,7 @@ while-loop that sits between env, user sim, and the vLLM policy.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -495,8 +496,16 @@ def make_user(task: Task, llm: str, llm_args: dict | None = None, env=None):
         llm=llm,
         instructions=str(task.tau2_task.user_scenario),
         tools=tools,
-        llm_args=llm_args or {"temperature": 0.0},
+        llm_args=llm_args if llm_args is not None else default_user_llm_args(),
     )
+
+
+def default_user_llm_args() -> dict:
+    """Thinking off on OpenRouter so the user-sim cannot eat the output budget."""
+    return {
+        "temperature": 0.0,
+        "extra_body": {"reasoning": {"enabled": False, "effort": "none"}},
+    }
 
 
 def evaluate_episode(task: Task, tau_messages: list, termination: str, retrieval: str) -> float:
@@ -522,8 +531,11 @@ def evaluate_episode(task: Task, tau_messages: list, termination: str, retrieval
         simulation=sim,
         task=task.tau2_task,
         evaluation_type=EvaluationType.ALL,
+        solo_mode=False,
         domain=task.domain,
-        env_kwargs=env_kwargs_for(task, retrieval),
+        env_kwargs={
+            k: v for k, v in env_kwargs_for(task, retrieval).items() if k != "solo_mode"
+        },
     )
     return float(info.reward)
 
@@ -681,6 +693,39 @@ def _to_tau_messages(messages: list[dict]):
     return out
 
 
+async def _retry_transient(fn, *, tries: int = 6, base: float = 1.5, cap: float = 30.0):
+    """Retry a thread-executed LLM op through transient provider errors (429 /
+    upstream overload / timeout). Re-raises the last error once tries are spent."""
+    last = None
+    for i in range(tries):
+        try:
+            return await asyncio.to_thread(fn)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            s = f"{type(exc).__name__} {exc}".lower()
+            transient = any(
+                k in s
+                for k in (
+                    "ratelimit",
+                    "429",
+                    "rate-limited",
+                    "overload",
+                    "engine_overloaded",
+                    "timeout",
+                    "timed out",
+                    "temporarily",
+                    "503",
+                    "502",
+                    "unavailable",
+                )
+            )
+            if i + 1 < tries and transient:
+                await asyncio.sleep(min(base * (2**i), cap))
+                continue
+            raise
+    raise last
+
+
 async def run_tau2_episode(
     task: Task,
     *,
@@ -693,8 +738,6 @@ async def run_tau2_episode(
     user_llm_args: dict | None = None,
 ) -> EpisodeResult:
     """Full tau2 wiring: env + user sim + evaluator around `run_episode`."""
-    import asyncio
-
     from tau2.data_model.message import AssistantMessage, ToolCall
     from tau2.user.user_simulator import UserSimulator
 
@@ -712,7 +755,7 @@ async def run_tau2_episode(
 
         started = time.monotonic()
         try:
-            user_msg, _ = await asyncio.to_thread(_call)
+            user_msg, _ = await _retry_transient(_call)
         except Exception as exc:
             logger.exception(
                 "tau2 user simulator failed for task %s (%s)",

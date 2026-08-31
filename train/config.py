@@ -295,7 +295,7 @@ class DataConfig(BaseConfig):
     n_heldout: int = 27
     split_seed: int = 0
     retrieval: str = "alltools-qwen"
-    user_llm: str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    user_llm: str = "openrouter/deepseek/deepseek-v4-flash"
     # Parallel Search (diligence TIR only). https://docs.parallel.ai/search/search-quickstart
     search_mode: str = "fast"
     search_timeout: float = 30.0

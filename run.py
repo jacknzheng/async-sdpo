@@ -687,6 +687,17 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
 
     if rank == 0:
         stop = asyncio.Event()
+        if resume_path is None:
+            await evaluate_and_log(
+                engine,
+                judge,
+                heldout_tasks,
+                0,
+                trainer.state.policy_version,
+                dataset=config.data.dataset,
+                max_concurrency=config.judge.max_concurrency,
+                phase="baseline",
+            )
         train_loader = build_dataloader(
             config, TaskDataset(train_tasks), is_train=True, is_fully_async=True
         )
@@ -744,11 +755,15 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                             trainer.state.step,
                             extra={**metrics, **store.metrics()},
                         )
-                if trainer.state.step % config.judge.eval_interval == 0:
+                if (
+                    trainer.state.step % config.judge.eval_interval == 0
+                    and trainer.state.step < config.trainer.total_steps
+                ):
                     # Block the next optimizer/weight-sync step until eval
                     # finishes. Otherwise a long asynchronous eval can span
                     # several policy versions and the next 25-step boundary
-                    # is silently skipped.
+                    # is silently skipped. The last step is the final pass
+                    # after the loop so we do not score the finished model twice.
                     await evaluate_and_log(
                         engine,
                         judge,
@@ -757,6 +772,7 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                         trainer.state.policy_version,
                         dataset=config.data.dataset,
                         max_concurrency=config.judge.max_concurrency,
+                        phase="interval",
                     )
 
             # All ranks enter: FSDP gather inside state_dict(); rank 0 writes.
@@ -766,6 +782,26 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                 )
 
         save_checkpoint(trainer, config.logging.output_dir, "final")
+        if rank == 0 and engine is not None:
+            if stop is not None:
+                stop.set()
+            if rollout_task is not None:
+                rollout_task.cancel()
+                try:
+                    await rollout_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                rollout_task = None
+            await evaluate_and_log(
+                engine,
+                judge,
+                heldout_tasks,
+                trainer.state.step,
+                trainer.state.policy_version,
+                dataset=config.data.dataset,
+                max_concurrency=config.judge.max_concurrency,
+                phase="final",
+            )
     finally:
         if rank == 0:
             if stop is not None:
@@ -807,6 +843,7 @@ async def baseline(config: Config, ctx: RunContext | None = None) -> None:
             0,
             dataset=config.data.dataset,
             max_concurrency=config.judge.max_concurrency,
+            phase="baseline",
         )
         if metrics is None:
             raise RuntimeError("baseline evaluation failed; inspect evaluations.jsonl")

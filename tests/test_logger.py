@@ -107,6 +107,7 @@ def test_pass1_records_one_failed_task_without_aborting_eval(monkeypatch):
         )
     )
     assert metrics is not None
+    assert "_eval_rows" not in metrics
     assert metrics["pass1"] == 1.0
     assert metrics["n"] == 1.0
     assert metrics["eval_requested"] == 2.0
@@ -207,3 +208,56 @@ def test_rollout_sample_rows_include_prompt_hint_and_output():
 
 def test_log_rollout_samples_is_a_noop_without_wandb():
     log_rollout_samples(None, [], step=1)
+
+
+def test_evaluate_and_log_uses_trainer_step_on_wandb(monkeypatch):
+    logged = []
+
+    class FakeTable:
+        def __init__(self, columns, data):
+            self.columns = columns
+            self.data = data
+
+    class FakeRun:
+        pass
+
+    class FakeWandb:
+        run = FakeRun()
+        Table = FakeTable
+
+        @staticmethod
+        def log(payload, step=None):
+            logged.append((payload, step))
+
+    monkeypatch.setitem(__import__("sys").modules, "wandb", FakeWandb)
+    monkeypatch.setattr("train.logger.artifact_event", lambda *a, **k: None)
+
+    class Engine:
+        async def generate_tir(self, task):
+            return SimpleNamespace(
+                judge_score=1.0,
+                text="ok",
+                prompt_token_ids=[1],
+                response_token_ids=[2],
+            )
+
+    metrics = asyncio.run(
+        evaluate_and_log(
+            Engine(),
+            None,
+            [SimpleNamespace(task_id="t", domain="retail", query="q")],
+            step=50,
+            policy_version=7,
+            dataset="tau2",
+            max_concurrency=1,
+            phase="interval",
+        )
+    )
+    assert metrics["pass1"] == 1.0
+    assert logged
+    payload, step = logged[0]
+    assert step == 50
+    assert payload["eval/pass1"] == 1.0
+    assert payload["eval/phase"] == "interval"
+    assert payload["eval/launched_at_step"] == 50.0
+    assert isinstance(payload["eval/tasks"], FakeTable)

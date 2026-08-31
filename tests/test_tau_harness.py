@@ -17,7 +17,9 @@ from data.tau_harness import (
     AgentTurn,
     SandboxNamespaceError,
     ToolCallSpec,
+    _retry_transient,
     assert_sandbox_ready,
+    default_user_llm_args,
     env_kwargs_for,
     format_transcript,
     gold_suffix,
@@ -49,6 +51,33 @@ def test_parse_qwen_tool_calls():
 def test_parse_skips_malformed_blocks():
     assert parse_tool_calls("<tool_call>not json</tool_call>") == []
     assert parse_tool_calls("no tools here") == []
+
+
+def test_default_user_llm_args_disable_thinking():
+    args = default_user_llm_args()
+    assert args["temperature"] == 0.0
+    assert args["extra_body"]["reasoning"] == {"enabled": False, "effort": "none"}
+
+
+def test_retry_transient_retries_429_then_succeeds():
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("RateLimitError 429 engine_overloaded")
+        return "ok"
+
+    assert asyncio.run(_retry_transient(boom, tries=4, base=0.0, cap=0.0)) == "ok"
+    assert calls["n"] == 3
+
+
+def test_retry_transient_does_not_retry_typeerror():
+    def boom():
+        raise TypeError("missing required positional argument: solo_mode")
+
+    with pytest.raises(TypeError, match="solo_mode"):
+        asyncio.run(_retry_transient(boom, tries=4, base=0.0, cap=0.0))
 
 
 def test_env_kwargs_carry_solo_mode_so_evaluate_simulation_must_not():

@@ -9,7 +9,7 @@
 #                 tool trajectory (retail, airline). No hint LLM. Cheap. Default.
 #   step_hint     Ablation B. After each rollout, OpenRouter DeepSeek names the
 #                 SINGLE next correct action given the gold + transcript.
-#   baseline      Zero-shot pass^1 on the 87 held-out tasks. No training.
+#   baseline      Zero-shot pass^1 on the official retail+airline test split.
 #   smoke         1 GPU, tiny model, 10 steps. Sanity check the loop, not a result.
 #   gold_banking  Same as gold but banking_knowledge only (97 tasks, no retail/airline).
 #
@@ -62,7 +62,11 @@ NPROC=4
 EXTRA=()
 case "$MODE" in
   gold)
-    EXTRA+=(generator.hint.prompt=gold)
+    EXTRA+=(
+      generator.hint.prompt=gold
+      "data.domains=[retail,airline]"
+      generator.engine.max_model_len=32768
+    )
     ;;
   step_hint)
     EXTRA+=(generator.hint.prompt=step_hint)
@@ -74,7 +78,12 @@ case "$MODE" in
     )
     ;;
   baseline)
-    EXTRA+=(--baseline generator.hint.prompt=gold)
+    EXTRA+=(
+      --baseline
+      generator.hint.prompt=gold
+      "data.domains=[retail,airline]"
+      generator.engine.max_model_len=32768
+    )
     NPROC=1
     ;;
   smoke)
