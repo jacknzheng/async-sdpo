@@ -222,7 +222,7 @@ def test_request_payload_is_correct(monkeypatch):
     assert payload["model"] == "provider/strict-model"
     # A non-deterministic judge would inject sampling noise into the eval curve itself.
     assert payload["temperature"] == 0.0
-    assert payload["reasoning"] == {"enabled": True}
+    assert payload["reasoning"] == {"enabled": False, "effort": "none"}
     # Anthropic took `system` as a top-level kwarg; on the OpenAI wire it is a message.
     assert payload["messages"][0] == {"role": "system", "content": "SYSTEM PROMPT"}
     assert payload["messages"][1] == {"role": "user", "content": "USER PROMPT"}

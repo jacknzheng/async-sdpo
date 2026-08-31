@@ -10,10 +10,13 @@ from data.diagnostics import ARTIFACT_FILES, artifact_event
 from train.config import Config, to_yaml
 from train.logger import (
     evaluate_and_log,
+    log_rollout_samples,
     make_run_name,
+    rollout_sample_rows,
     setup_run_logging,
     wandb_run_config,
 )
+from train.models import Trajectory
 
 
 def test_make_run_name_includes_dataset_hint_and_time():
@@ -175,3 +178,32 @@ def test_diligence_eval_records_response_and_judge_score(monkeypatch):
     assert task_event["launched_at_step"] == 50
     assert task_event["response_text"] == "Revenue increased."
     assert task_event["score"] == 0.75
+
+
+def test_rollout_sample_rows_include_prompt_hint_and_output():
+    batch = [
+        Trajectory(
+            task_id="t1",
+            prompt_token_ids=[1],
+            response_token_ids=[2],
+            rollout_logprobs=[0.0],
+            policy_version=1,
+            hint_free="do not cite the figure",
+            hint_bearing="the figure is 12",
+            query="Assess the funding base.",
+            response_text="Deposits grew.",
+        )
+    ]
+    assert rollout_sample_rows(batch) == [
+        [
+            "t1",
+            "Assess the funding base.",
+            "Deposits grew.",
+            "do not cite the figure",
+            "the figure is 12",
+        ]
+    ]
+
+
+def test_log_rollout_samples_is_a_noop_without_wandb():
+    log_rollout_samples(None, [], step=1)

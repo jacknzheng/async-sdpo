@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diligence-bench SDPO on 8 GPUs (4 vLLM rollout + 3 FSDP trainer + 1 hint).
+# Diligence-bench SDPO on 8 GPUs (4 vLLM rollout + 4 FSDP trainer).
 #
 # Usage:
 #   bash scripts/run_diligencebench.sh <mode> [extra dotted overrides...]
@@ -21,8 +21,8 @@
 #   bash scripts/run_diligencebench.sh answer_bearing trainer.total_steps=200
 #   bash scripts/run_diligencebench.sh baseline
 #
-# Needs: 8 GPUs (4+3+1), PARALLEL_API_KEY (web search), OPENROUTER_API_KEY
-#        (diligence judge), WANDB_API_KEY. Hints run on cuda:7 (Qwen3.5-9B).
+# Needs: 8 GPUs (4+4), PARALLEL_API_KEY (web search), OPENROUTER_API_KEY
+#        (diligence judge + DeepSeek hints), WANDB_API_KEY.
 # Logs:  /log/<run_name>/{train.log,console.log,args.txt,config.yaml}
 set -euo pipefail
 
@@ -59,7 +59,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export WANDB_PROJECT="${WANDB_PROJECT:-sdpo-diligence}"
 
-NPROC=3
+NPROC=4
 EXTRA=(
   data.dataset=diligence
   data.n_heldout=30

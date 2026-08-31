@@ -233,7 +233,7 @@ def _build(prompt_variant="answer_free"):
             response_text=DRAFT,
             prompt_variant=prompt_variant,
             backend="openrouter",
-            model="nvidia/nemotron-3-super-120b-a12b:free",
+            model="deepseek/deepseek-v4-flash-latest",
         )
     )
 
@@ -297,12 +297,12 @@ def test_hint_request_sends_no_response_format(monkeypatch):
     sent = _stub_openrouter(monkeypatch, "- how deposit cost trended against balances")
     _build("answer_free")
     payload = json.loads(sent[0]["data"])
-    assert payload["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert payload["model"] == "deepseek/deepseek-v4-flash-latest"
     assert "response_format" not in payload
     assert "provider" not in payload
     assert payload["temperature"] == 0.0
     assert payload["max_tokens"] == 2048
-    assert payload["reasoning"] == {"enabled": False}
+    assert payload["reasoning"] == {"enabled": False, "effort": "none"}
 
 
 def test_api_failure_returns_empty_not_raises(monkeypatch):

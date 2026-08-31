@@ -59,7 +59,7 @@ def make_config(**overrides) -> Config:
     # of 2 is valid without every call site repeating n_trainer_gpus=1.
     if "n_trainer_gpus" not in overrides:
         overrides = {**overrides, "n_trainer_gpus": 1}
-    # Offline tests stub OpenRouter; do not reserve the ninth hint GPU.
+    # Offline tests stub OpenRouter; do not start a local hint engine.
     if "error_hint_backend" not in overrides:
         overrides = {**overrides, "error_hint_backend": "openrouter"}
     return Config.from_cli_overrides([f"{dotted[k]}={v}" for k, v in overrides.items()])

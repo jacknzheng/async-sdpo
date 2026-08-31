@@ -38,24 +38,35 @@ def test_smoke_overrides_do_not_raise():
 
 
 def test_answer_free_uses_local_hint_engine():
-    cfg = Config.from_cli_overrides(["generator.hint.prompt=answer_free"])
+    cfg = Config.from_cli_overrides(
+        [
+            "generator.hint.prompt=answer_free",
+            "generator.hint.backend=vllm",
+            "trainer.n_trainer_gpus=3",
+            "trainer.batch_size=18",
+        ]
+    )
     assert cfg.uses_local_hint_engine()
     assert not Config().uses_local_hint_engine()
+    assert not Config.from_cli_overrides(
+        ["generator.hint.prompt=answer_free"]
+    ).uses_local_hint_engine()
 
 
 def test_default_split_uses_the_whole_box():
     cfg = Config()
     assert cfg.generator.engine.n_rollout_gpus == 4
-    assert cfg.trainer.n_trainer_gpus == 3
-    assert cfg.generator.hint.backend == "vllm"
-    assert cfg.generator.hint.gpu == 7
+    assert cfg.trainer.n_trainer_gpus == 4
+    assert cfg.generator.hint.backend == "openrouter"
     assert cfg.total_num_gpus == 8
     assert cfg.reserved_gpus() == 8
 
 
 def test_vllm_hint_on_seven_gpus_rejected():
     with pytest.raises(ValueError, match="<= 7"):
-        Config.from_cli_overrides(["total_num_gpus=7"])
+        Config.from_cli_overrides(
+            ["total_num_gpus=7", "generator.hint.backend=vllm"]
+        )
 
 
 def test_gpu_split_over_capacity_rejected():
@@ -63,15 +74,22 @@ def test_gpu_split_over_capacity_rejected():
         Config.from_cli_overrides(
             [
                 "generator.engine.n_rollout_gpus=8",
-                "trainer.n_trainer_gpus=3",
-                "trainer.batch_size=18",
+                "trainer.n_trainer_gpus=4",
+                "trainer.batch_size=16",
             ]
         )
 
 
 def test_hint_gpu_must_not_overlap_rollout_or_trainer():
     with pytest.raises(ValueError, match="overlaps"):
-        Config.from_cli_overrides(["generator.hint.gpu=3"])
+        Config.from_cli_overrides(
+            [
+                "generator.hint.backend=vllm",
+                "generator.hint.gpu=3",
+                "trainer.n_trainer_gpus=3",
+                "trainer.batch_size=18",
+            ]
+        )
 
 
 def test_unknown_hint_backend_rejected():
@@ -137,14 +155,13 @@ def test_default_is_proven_tau2_8b_stack():
     assert cfg.model.model == "Qwen/Qwen3-8B"
     assert cfg.trainer.gradient_checkpointing is True
     assert cfg.trainer.mini_batch_size == 2
-    assert cfg.trainer.batch_size == 18
-    assert cfg.trainer.n_trainer_gpus == 3
+    assert cfg.trainer.batch_size == 16
+    assert cfg.trainer.n_trainer_gpus == 4
     assert cfg.generator.engine.max_model_len == 16384
     assert cfg.generator.engine.disable_custom_all_reduce is True
     assert cfg.generator.hint.prompt == "gold"
-    assert cfg.generator.hint.backend == "vllm"
-    assert cfg.generator.hint.model == "Qwen/Qwen3.5-9B"
-    assert cfg.generator.hint.gpu == 7
+    assert cfg.generator.hint.backend == "openrouter"
+    assert cfg.generator.hint.model == "deepseek/deepseek-v4-flash-latest"
     assert cfg.generator.hint.max_tokens == 2048
     assert cfg.generator.hint.reasoning_enabled is False
     assert (
@@ -152,6 +169,7 @@ def test_default_is_proven_tau2_8b_stack():
         == "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
     )
     assert cfg.judge.model == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert cfg.judge.reasoning_enabled is False
     assert cfg.logging.log_dir == "/log"
     assert cfg.logging.resume_from is None
     assert cfg.logging.wandb_enabled is True

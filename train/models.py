@@ -26,6 +26,8 @@ class Trajectory:
     policy_version: int
     hint_free: str = ""
     hint_bearing: str = ""
+    query: str = ""
+    response_text: str = ""
     # Judge score, attached opportunistically for diagnostics. Never used in the loss, and
     # never gates whether a trajectory is trained on: the blog's headline finding is that
     # G=1 with failures RETAINED is the most efficient configuration.

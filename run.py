@@ -102,6 +102,7 @@ from train.logger import (  # noqa: E402
     RunContext,
     evaluate_and_log,
     init_wandb,
+    log_rollout_samples,
     setup_run_logging,
 )
 from data.dataset import load_split  # noqa: E402
@@ -440,6 +441,8 @@ async def generate_trajectory(
             policy_version=version,
             hint_free=hints.free,
             hint_bearing=hints.bearing,
+            query=task.query,
+            response_text=result.text,
             judge_score=result.judge_score,
             step_spans=list(result.step_spans),
             loss_mask=list(result.loss_mask),
@@ -451,6 +454,7 @@ async def generate_trajectory(
         task_id=task.task_id,
         domain=task.domain,
         policy_version=version,
+        query=task.query,
         response_text=result.text,
         hint_free=hints.free,
         hint_bearing=hints.bearing,
@@ -531,7 +535,7 @@ def _pick_weight_sync_port(host: str, preferred: int) -> int:
 
 
 def assert_visible_gpus(config: Config) -> None:
-    """Refuse to start if the box is smaller than the reserved 4+3+1 map.
+    """Refuse to start if the box is smaller than the reserved rollout+trainer map.
 
     The operator default is 2 GPUs. This job requests 8 and does not degrade.
     """
@@ -562,7 +566,7 @@ def assert_visible_gpus(config: Config) -> None:
         f"({config.generator.engine.n_rollout_gpus} rollout + "
         f"{config.trainer.n_trainer_gpus} trainer{hint}); saw {visible}. "
         "Operator default of 2 is not enough; request an 8-GPU box "
-        "(4 rollout + 3 trainer + 1 hint). Do not colocate hints or use NPROC=1.\n"
+        "(4 rollout + 4 trainer). Do not use NPROC=1.\n"
         f"{nvidia}"
     )
 
@@ -635,6 +639,7 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                 config.judge.max_concurrency,
                 config.judge.max_retries,
                 config.judge.timeout,
+                reasoning_enabled=config.judge.reasoning_enabled,
             )
 
     _init_trainer_process_group(config)
@@ -733,8 +738,11 @@ async def train(config: Config, smoke: bool = False, ctx: RunContext | None = No
                 if trainer.state.step % config.logging.log_interval == 0:
                     log_metrics(metrics, store)
                     if wandb is not None:
-                        wandb.log(
-                            {**metrics, **store.metrics()}, step=trainer.state.step
+                        log_rollout_samples(
+                            wandb,
+                            batch,
+                            trainer.state.step,
+                            extra={**metrics, **store.metrics()},
                         )
                 if trainer.state.step % config.judge.eval_interval == 0:
                     # Block the next optimizer/weight-sync step until eval
@@ -789,6 +797,7 @@ async def baseline(config: Config, ctx: RunContext | None = None) -> None:
                 config.judge.max_concurrency,
                 config.judge.max_retries,
                 config.judge.timeout,
+                reasoning_enabled=config.judge.reasoning_enabled,
             )
         metrics = await evaluate_and_log(
             engine,

@@ -230,6 +230,34 @@ def init_wandb(config: Config, ctx: RunContext):
     return run
 
 
+def rollout_sample_rows(batch) -> list[list[str]]:
+    """One row per trajectory: student prompt, model output, and both hint arms."""
+    return [
+        [
+            trajectory.task_id,
+            trajectory.query,
+            trajectory.response_text,
+            trajectory.hint_free,
+            trajectory.hint_bearing,
+        ]
+        for trajectory in batch
+    ]
+
+
+def log_rollout_samples(wandb_run, batch, step: int, extra: dict | None = None) -> None:
+    """Upload the training batch's prompt / hint / output text to wandb."""
+    if wandb_run is None:
+        return
+    import wandb
+
+    payload = dict(extra or {})
+    payload["samples"] = wandb.Table(
+        columns=["task_id", "prompt", "output", "hint_free", "hint_bearing"],
+        data=rollout_sample_rows(batch),
+    )
+    wandb_run.log(payload, step=step)
+
+
 async def evaluate(
     engine: InferenceEngine,
     judge: RubricJudge,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tau-bench SDPO on 8 GPUs (4 vLLM rollout + 3 FSDP trainer + 1 hint).
+# Tau-bench SDPO on 8 GPUs (4 vLLM rollout + 4 FSDP trainer).
 #
 # Usage:
 #   bash scripts/run_taubench.sh <mode> [extra dotted overrides...]
@@ -7,7 +7,7 @@
 # Modes
 #   gold          Ablation A. Teacher sees Sierra gold docs (banking) / canonical
 #                 tool trajectory (retail, airline). No hint LLM. Cheap. Default.
-#   step_hint     Ablation B. After each rollout, the local hint GPU names the
+#   step_hint     Ablation B. After each rollout, OpenRouter DeepSeek names the
 #                 SINGLE next correct action given the gold + transcript.
 #   baseline      Zero-shot pass^1 on the 87 held-out tasks. No training.
 #   smoke         1 GPU, tiny model, 10 steps. Sanity check the loop, not a result.
@@ -18,7 +18,7 @@
 #   bash scripts/run_taubench.sh step_hint trainer.total_steps=200
 #   bash scripts/run_taubench.sh baseline
 #
-# Needs: 8 GPUs (4+3+1), OPENROUTER_API_KEY (tau2 user sim), WANDB_API_KEY,
+# Needs: 8 GPUs (4+4), OPENROUTER_API_KEY (tau2 user sim + DeepSeek hints), WANDB_API_KEY,
 #        `uv sync --extra knowledge`, `bash scripts/setup_tau2_sandbox.sh`
 #        `which` is not enough — bwrap must be able to create namespaces
 #        (--privileged / seccomp=unconfined). run.py probes this and exits.
@@ -58,7 +58,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export WANDB_PROJECT="${WANDB_PROJECT:-sdpo-tau2}"
 
-NPROC=3
+NPROC=4
 EXTRA=()
 case "$MODE" in
   gold)

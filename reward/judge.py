@@ -109,7 +109,7 @@ async def chat_completion(
     max_tokens: int = 16000,
     timeout: float = 120.0,
     max_retries: int = 3,
-    reasoning_enabled: bool = True,
+    reasoning_enabled: bool = False,
     response_schema: dict | None = None,
     parse: Callable[[str], object] | None = None,
 ):
@@ -208,7 +208,11 @@ def _chat_payload(
         # metric, and for hints it keeps the same rollout from yielding a different teacher
         # on a rerun.
         "temperature": 0.0,
-        "reasoning": {"enabled": reasoning_enabled},
+        "reasoning": (
+            {"enabled": False, "effort": "none"}
+            if not reasoning_enabled
+            else {"enabled": True}
+        ),
     }
     if mode == "json_schema":
         payload["response_format"] = {
@@ -342,6 +346,7 @@ class OpenRouterOneShotGenerator:
         max_retries: int = 3,
         max_tokens: int = 16000,
         timeout: float = 120.0,
+        reasoning_enabled: bool = False,
     ) -> None:
         # Raise at construction rather than surfacing a missing key as three retried
         # failures per task and a silently zeroed eval curve.
@@ -350,6 +355,7 @@ class OpenRouterOneShotGenerator:
         self.max_retries = max_retries
         self.max_tokens = max_tokens
         self.timeout = timeout
+        self.reasoning_enabled = reasoning_enabled
 
     async def __call__(self, system_prompt: str, user_prompt: str, **kwargs) -> OneShotOutput:
         return await chat_completion(
@@ -360,6 +366,7 @@ class OpenRouterOneShotGenerator:
             max_tokens=self.max_tokens,
             timeout=self.timeout,
             max_retries=self.max_retries,
+            reasoning_enabled=self.reasoning_enabled,
             response_schema=SCHEMA,
             parse=OneShotOutput.model_validate_json,
         )
@@ -374,11 +381,15 @@ class RubricJudge:
         max_concurrency: int = 8,
         max_retries: int = 3,
         timeout: float = 120.0,
+        reasoning_enabled: bool = False,
     ) -> None:
         self.model = model
         self.grader = PerCriterionOneShotGrader(
             generate_fn=OpenRouterOneShotGenerator(
-                model=model, max_retries=max_retries, timeout=timeout
+                model=model,
+                max_retries=max_retries,
+                timeout=timeout,
+                reasoning_enabled=reasoning_enabled,
             ),
             # normalize=True divides by total positive weight, which is what we want:
             # diligence-bench weights are unnormalized and row totals range 115-370, so

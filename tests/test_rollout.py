@@ -368,7 +368,7 @@ def test_hint_receives_the_configured_prompt_variant(monkeypatch):
     assert seen["prompt_variant"] == "answer_bearing"
     assert seen["response_text"] == "the draft text"
     assert seen["query"] == "Assess the funding base."
-    assert seen["model"] == "Qwen/Qwen3.5-9B"
+    assert seen["model"] == "deepseek/deepseek-v4-flash-latest"
     assert seen["backend"] == "openrouter"
     assert seen["max_retries"] == 5
     assert seen["max_tokens"] == 2048

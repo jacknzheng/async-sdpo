@@ -124,10 +124,10 @@ HINT_BACKENDS = ("vllm", "openrouter")
 @dataclass(frozen=True)
 class HintConfig(BaseConfig):
     prompt: str = "gold"
-    # Frozen one-GPU vLLM by default. openrouter remains an explicit fallback.
-    backend: str = "vllm"
-    model: str = "Qwen/Qwen3.5-9B"
-    # Last visible device on the 4+3+1 / 8-GPU map (cuda:7).
+    # OpenRouter by default. backend=vllm still starts a frozen one-GPU hinter.
+    backend: str = "openrouter"
+    model: str = "deepseek/deepseek-v4-flash-latest"
+    # Only used when backend=vllm. Last unused device on an 8-GPU 4+3+1 map.
     gpu: int = 7
     concurrency: int = 4
     timeout: float = 90.0
@@ -255,8 +255,8 @@ class TrainerConfig(BaseConfig):
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 
-    n_trainer_gpus: int = 3
-    batch_size: int = 18             # divisible by 3
+    n_trainer_gpus: int = 4
+    batch_size: int = 16             # divisible by 4
     eval_batch_size: int = 16
     mini_batch_size: int = 2
 
@@ -325,6 +325,9 @@ class JudgeConfig(BaseConfig):
     max_retries: int = 5
     timeout: float = 120.0
     eval_interval: int = 25
+    # OpenRouter counts hidden reasoning against max_tokens. Keep it off so
+    # the structured score is not truncated by thinking.
+    reasoning_enabled: bool = False
 
 
 @dataclass(frozen=True)

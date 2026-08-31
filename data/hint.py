@@ -121,7 +121,7 @@ async def build_error_hint(
     sections: list[dict] | None = None,
     response_text: str = "",
     prompt_variant: str = "answer_free",
-    model: str = "Qwen/Qwen3.5-9B",
+    model: str = "deepseek/deepseek-v4-flash-latest",
     timeout: float = 90.0,
     max_retries: int = 5,
     max_tokens: int = 2048,
