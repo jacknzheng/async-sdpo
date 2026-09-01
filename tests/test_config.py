@@ -152,6 +152,7 @@ def test_gold_and_step_hint_prompts_accepted():
 def test_default_is_proven_tau2_8b_stack():
     cfg = Config()
     assert cfg.data.dataset == "tau2"
+    assert cfg.data.domains == ["retail", "airline"]
     assert cfg.model.model == "Qwen/Qwen3-8B"
     assert cfg.trainer.gradient_checkpointing is True
     assert cfg.trainer.mini_batch_size == 2
@@ -175,6 +176,11 @@ def test_default_is_proven_tau2_8b_stack():
     assert cfg.trainer.algorithm.use_sod is True
     assert cfg.trainer.algorithm.sod_delta == 0.2
     assert cfg.data.search_mode == "fast"
+
+
+def test_banking_domain_is_rejected():
+    with pytest.raises(ValueError, match="retail"):
+        Config.from_cli_overrides(["data.domains=[banking_knowledge]"])
 
 
 def test_sod_eps_must_be_positive():

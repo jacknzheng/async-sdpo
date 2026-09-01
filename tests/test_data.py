@@ -104,9 +104,9 @@ def test_split_sizes_and_disjointness():
 
 
 def test_namespaced_ids_split():
-    """Banking-style ids are not ints; the carve must still be 70/27 and disjoint."""
+    """Non-int ids still carve a deterministic disjoint split (diligence-style)."""
     tasks = [
-        Task(task_id=f"banking_knowledge:task_{i:03d}", query=f"q{i}", sections=[])
+        Task(task_id=f"retail:task_{i:03d}", query=f"q{i}", sections=[])
         for i in range(1, 98)
     ]
     train, heldout = split_tasks(tasks, n_heldout=27, seed=0)

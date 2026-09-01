@@ -3,9 +3,8 @@
 Diligence-bench ships 150 rows in a single split named "test". We carve a
 deterministic 120/30 split when `data.dataset=diligence`.
 
-Tau2 mixes three domains into one pool. Retail and airline have official
-train/test splits; banking_knowledge does not, so we carve 70/27. Task ids
-collide across domains (`"0"` exists in both retail and airline), so every uid
+Tau2 mixes retail and airline into one pool. Both have official train/test
+splits. Task ids collide across domains (`"0"` exists in both), so every uid
 is `"{domain}:{task.id}"`.
 """
 
@@ -153,40 +152,38 @@ def wrap_tau2_task(domain: str, tau2_task: Any) -> Task:
     )
 
 
+TAU2_DOMAINS = ("retail", "airline")
+
+
 def load_tau2_split(
-    domains: tuple[str, ...] = ("banking_knowledge", "retail", "airline"),
-    n_heldout: int = 27,
+    domains: tuple[str, ...] = TAU2_DOMAINS,
+    n_heldout: int = 30,
     split_seed: int = 0,
 ) -> tuple[list[Task], list[Task]]:
-    """Official retail/airline splits plus a carved banking_knowledge 70/27.
+    """Official retail/airline train and test splits.
 
-    Combined: 174 train / 87 held-out.
+    `n_heldout` / `split_seed` are unused here (kept so load_split can pass
+    the diligence carve fields through). Combined size is whatever Sierra
+    ships for the requested domains.
     """
+    del n_heldout, split_seed
     try:
         from tau2.registry import registry
     except ImportError as exc:
         raise ImportError(
-            "tau2 is not installed. `uv sync --extra tau2` (retail/airline) or "
-            "`uv sync --extra knowledge` (also banking_knowledge)."
+            "tau2 is not installed. `uv sync --extra tau2`."
         ) from exc
 
     train: list[Task] = []
     heldout: list[Task] = []
     for domain in domains:
+        if domain not in TAU2_DOMAINS:
+            raise ValueError(
+                f"unsupported tau2 domain {domain!r}; expected retail or airline"
+            )
         loader = registry.get_tasks_loader(domain)
-        if domain in ("retail", "airline"):
-            train.extend(wrap_tau2_task(domain, t) for t in loader("train"))
-            heldout.extend(wrap_tau2_task(domain, t) for t in loader("test"))
-            continue
-        if domain == "banking_knowledge":
-            wrapped = [wrap_tau2_task(domain, t) for t in loader()]
-            carved_train, carved_held = split_tasks(wrapped, n_heldout=n_heldout, seed=split_seed)
-            train.extend(carved_train)
-            heldout.extend(carved_held)
-            continue
-        raise ValueError(
-            f"unsupported tau2 domain {domain!r}; expected banking_knowledge, retail, or airline"
-        )
+        train.extend(wrap_tau2_task(domain, t) for t in loader("train"))
+        heldout.extend(wrap_tau2_task(domain, t) for t in loader("test"))
     return train, heldout
 
 

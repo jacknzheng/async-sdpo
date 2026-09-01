@@ -44,7 +44,6 @@ import argparse
 from data.dataset import Task, TaskDataset
 from data.diagnostics import artifact_event
 from data.hint import generate_hint, set_hint_engine
-from data.tau_harness import configure_embeddings_cache
 
 import torch
 import torch.distributed as dist
@@ -91,7 +90,6 @@ if os.path.isdir("/workspace"):
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/workspace/.cache/torchinductor")
     os.environ.setdefault("TRITON_CACHE_DIR", "/workspace/.cache/triton")
     os.environ.setdefault("HF_HOME", "/workspace/hf")
-configure_embeddings_cache()
 # Qwen3-8B pure-bf16 AdamW sits at ~65 of 80 GB per trainer rank (16 weights + 16 grads
 # + 33 optimizer state); expandable segments lets the allocator grow in place instead of
 # fragmenting. Drop this line if vLLM ever objects -- it is an aid, not a requirement.
@@ -857,7 +855,7 @@ async def baseline(config: Config, ctx: RunContext | None = None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Off-policy SDPO on tau2 (banking_knowledge / retail / airline)",
+        description="Off-policy SDPO on tau2 (retail / airline)",
         epilog="Any trailing dotted args override config, e.g. trainer.optimizer.learning_rate=1e-5",
     )
     parser.add_argument("--smoke", action="store_true", help="tiny model, 4 tasks, 10 steps")
@@ -888,19 +886,8 @@ def main() -> None:
     ctx = setup_run_logging(
         config, sys.argv, rank=rank, smoke=args.smoke, baseline=args.baseline
     )
-    # Rank 0, before NCCL: `which bwrap` is a false green on GPU pods that
-    # seccomp-block unshare. Fail here so we do not spend an hour generating
-    # zero-reward banking episodes.
     if rank == 0:
         assert_visible_gpus(config)
-    if rank == 0 and config.data.dataset == "tau2":
-        from data.tau_harness import SandboxNamespaceError, assert_sandbox_ready
-
-        try:
-            assert_sandbox_ready(config.data.domains)
-        except SandboxNamespaceError as exc:
-            logger.critical("tau2 sandbox preflight failed: %s", exc)
-            raise SystemExit(f"tau2 sandbox not usable:\n{exc}") from exc
     if world > 1:
         if world != config.trainer.n_trainer_gpus:
             raise SystemExit(

@@ -1,7 +1,7 @@
 """Tau2 harness: episode loop, loss mask, gold teacher, mock domain.
 
 The loop tests inject fake generate_turn / env / user so they run on a laptop with no
-tau2, no vLLM, and no network. Real banking_knowledge tests are gated on the knowledge extra.
+tau2, no vLLM, and no network.
 """
 
 from __future__ import annotations
@@ -15,10 +15,8 @@ import torch
 from data.dataset import Task, wrap_tau2_task
 from data.tau_harness import (
     AgentTurn,
-    SandboxNamespaceError,
     ToolCallSpec,
     _retry_transient,
-    assert_sandbox_ready,
     default_user_llm_args,
     env_kwargs_for,
     format_transcript,
@@ -84,13 +82,11 @@ def test_env_kwargs_carry_solo_mode_so_evaluate_simulation_must_not():
     """Passing solo_mode both as a kwarg and inside env_kwargs TypeErrors and
     zeros retail/airline reward in the evaluate_episode except-handler."""
     retail = Task(task_id="r", query="x", sections=[], domain="retail", tau2_task=object())
-    banking = Task(
-        task_id="b", query="x", sections=[], domain="banking_knowledge", tau2_task=object()
+    airline = Task(
+        task_id="a", query="x", sections=[], domain="airline", tau2_task=object()
     )
     assert env_kwargs_for(retail) == {"solo_mode": False}
-    banking_kw = env_kwargs_for(banking)
-    assert banking_kw["solo_mode"] is False
-    assert "retrieval_variant" in banking_kw
+    assert env_kwargs_for(airline) == {"solo_mode": False}
 
 
 def test_episode_masks_injected_spans_and_trains_on_sampled():
@@ -265,14 +261,6 @@ def _tau2_installed() -> bool:
     return importlib.util.find_spec("tau2") is not None
 
 
-def _knowledge_installed() -> bool:
-    import importlib.util
-
-    if not _tau2_installed():
-        return False
-    return importlib.util.find_spec("tau2.knowledge") is not None
-
-
 @pytest.mark.tau2
 @pytest.mark.skipif(not _tau2_installed(), reason="tau2 extra not installed")
 def test_mock_domain_loads():
@@ -285,97 +273,3 @@ def test_mock_domain_loads():
     wrapped = wrap_tau2_task("mock", tasks[0])
     assert wrapped.task_id.startswith("mock:")
     assert wrapped.tau2_task is tasks[0]
-
-
-@pytest.mark.knowledge
-@pytest.mark.skipif(
-    not _knowledge_installed(), reason="tau2[knowledge] extra not installed"
-)
-def test_banking_knowledge_loads_and_namespaces():
-    from tau2.registry import registry
-
-    tasks = registry.get_tasks_loader("banking_knowledge")()
-    assert len(tasks) == 97
-    wrapped = wrap_tau2_task("banking_knowledge", tasks[0])
-    assert wrapped.task_id.startswith("banking_knowledge:")
-    assert wrapped.domain == "banking_knowledge"
-    titles = getattr(tasks[0], "required_documents", None) or []
-    if titles:
-        hint = gold_suffix(wrapped)
-        assert "Gold knowledge" in hint
-
-
-def test_sandbox_probe_skips_when_banking_not_in_domains(monkeypatch):
-    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
-    assert_sandbox_ready(["retail", "airline"])
-
-
-def test_sandbox_probe_skips_on_macos(monkeypatch):
-    monkeypatch.setattr("data.tau_harness.sys.platform", "darwin")
-    monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: None)
-    assert_sandbox_ready(["banking_knowledge"])
-
-
-def test_sandbox_probe_missing_binaries(monkeypatch):
-    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
-    monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: None)
-    with pytest.raises(SandboxNamespaceError, match="missing from PATH"):
-        assert_sandbox_ready(["banking_knowledge"])
-
-
-def test_sandbox_probe_namespace_denied(monkeypatch):
-    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
-    monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: f"/usr/bin/{_name}")
-    events = []
-
-    class _Proc:
-        returncode = 1
-        stdout = ""
-        stderr = "bwrap: Creating new namespace failed: Operation not permitted"
-
-    monkeypatch.setattr("data.tau_harness.subprocess.run", lambda *a, **k: _Proc())
-    monkeypatch.setattr(
-        "data.tau_harness.artifact_event",
-        lambda channel, event, **fields: events.append((channel, event, fields)),
-    )
-    with pytest.raises(SandboxNamespaceError, match="container policy"):
-        assert_sandbox_ready(["banking_knowledge"])
-    assert [event for _, event, _ in events] == [
-        "sandbox_preflight_started",
-        "sandbox_preflight_failed",
-    ]
-    assert events[-1][2]["cause"] == "namespace_probe_failed"
-    assert "Operation not permitted" in events[-1][2]["stderr"]
-
-
-def test_sandbox_probe_ok(monkeypatch):
-    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
-    monkeypatch.setattr("data.tau_harness.shutil.which", lambda _name: f"/usr/bin/{_name}")
-
-    def run(command, **kwargs):
-        return SimpleNamespace(
-            returncode=0,
-            stdout="srt-ok\n" if command[0] == "srt" else "bwrap-ok\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr("data.tau_harness.subprocess.run", run)
-    assert_sandbox_ready(["banking_knowledge"])
-
-
-def test_sandbox_probe_rejects_broken_srt_runtime(monkeypatch):
-    monkeypatch.setattr("data.tau_harness.sys.platform", "linux")
-    monkeypatch.setattr("data.tau_harness.shutil.which", lambda name: f"/usr/bin/{name}")
-
-    def run(command, **kwargs):
-        if command[0] == "srt":
-            return SimpleNamespace(
-                returncode=1,
-                stdout="",
-                stderr="sandbox runtime failed to launch bwrap",
-            )
-        return SimpleNamespace(returncode=0, stdout="bwrap-ok\n", stderr="")
-
-    monkeypatch.setattr("data.tau_harness.subprocess.run", run)
-    with pytest.raises(SandboxNamespaceError, match="srt end-to-end probe failed"):
-        assert_sandbox_ready(["banking_knowledge"])

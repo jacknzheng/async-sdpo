@@ -5,13 +5,12 @@
 #   bash scripts/run_taubench.sh <mode> [extra dotted overrides...]
 #
 # Modes
-#   gold          Ablation A. Teacher sees Sierra gold docs (banking) / canonical
-#                 tool trajectory (retail, airline). No hint LLM. Cheap. Default.
+#   gold          Ablation A. Teacher sees the canonical tool trajectory
+#                 (retail, airline). No hint LLM. Cheap. Default.
 #   step_hint     Ablation B. After each rollout, OpenRouter DeepSeek names the
 #                 SINGLE next correct action given the gold + transcript.
 #   baseline      Zero-shot pass^1 on the official retail+airline test split.
 #   smoke         1 GPU, tiny model, 10 steps. Sanity check the loop, not a result.
-#   gold_banking  Same as gold but banking_knowledge only (97 tasks, no retail/airline).
 #
 # Examples
 #   bash scripts/run_taubench.sh gold
@@ -19,9 +18,7 @@
 #   bash scripts/run_taubench.sh baseline
 #
 # Needs: 8 GPUs (4+4), OPENROUTER_API_KEY (tau2 user sim + DeepSeek hints), WANDB_API_KEY,
-#        `uv sync --extra knowledge`, `bash scripts/setup_tau2_sandbox.sh`
-#        `which` is not enough — bwrap must be able to create namespaces
-#        (--privileged / seccomp=unconfined). run.py probes this and exits.
+#        `uv sync --extra tau2`. Retail/airline do not need a host sandbox.
 # Logs:  /log/<run_name>/{train.log,console.log,args.txt,config.yaml}
 set -euo pipefail
 
@@ -39,7 +36,7 @@ fi
 
 MODE="${1:-}"
 if [[ -z "$MODE" || "$MODE" == "-h" || "$MODE" == "--help" ]]; then
-  sed -n '2,24p' "$0"
+  sed -n '2,22p' "$0"
   exit 0
 fi
 shift
@@ -71,12 +68,6 @@ case "$MODE" in
   step_hint)
     EXTRA+=(generator.hint.prompt=step_hint)
     ;;
-  gold_banking)
-    EXTRA+=(
-      generator.hint.prompt=gold
-      "data.domains=[banking_knowledge]"
-    )
-    ;;
   baseline)
     EXTRA+=(
       --baseline
@@ -91,7 +82,7 @@ case "$MODE" in
     NPROC=1
     ;;
   *)
-    echo "unknown mode ${MODE@Q}. try: gold step_hint baseline smoke gold_banking" >&2
+    echo "unknown mode ${MODE@Q}. try: gold step_hint baseline smoke" >&2
     exit 1
     ;;
 esac

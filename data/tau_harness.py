@@ -1,8 +1,8 @@
 """Tau2 episode loop: Environment + user simulator + evaluate_simulation.
 
 We do not use tau2's AgentGymEnv -- it `wait()`s on Python threads (fights asyncio +
-vLLM) and never forwards `retrieval_variant="alltools-qwen"`. This module is the
-while-loop that sits between env, user sim, and the vLLM policy.
+vLLM). This module is the while-loop that sits between env, user sim, and the
+vLLM policy. Domains are retail and airline only; there is no host sandbox.
 """
 
 from __future__ import annotations
@@ -11,11 +11,7 @@ import asyncio
 import inspect
 import json
 import logging
-import os
 import re
-import shutil
-import subprocess
-import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -25,163 +21,6 @@ from data.dataset import Task
 from data.diagnostics import artifact_event
 
 logger = logging.getLogger(__name__)
-
-# tau2's banking env only checks that these names exist on PATH. That is not
-# enough: GPU pods often install bwrap but seccomp-block `unshare`, so every
-# `shell` call then dies with "Creating new namespace failed: Operation not permitted".
-_SANDBOX_BINS = ("srt", "rg", "bwrap", "socat")
-_BWRAP_PROBE = (
-    "bwrap",
-    "--ro-bind",
-    "/",
-    "/",
-    "--dev",
-    "/dev",
-    "/bin/echo",
-    "bwrap-ok",
-)
-_SRT_PROBE = ("srt", "-c", "echo srt-ok")
-SANDBOX_NAMESPACE_HINT = """
-bwrap cannot create a Linux namespace on this host
-(typically: Creating new namespace failed: Operation not permitted).
-
-This is a container policy issue, not a missing install. Recreate the pod/container
-so nested namespaces are allowed:
-
-  docker:  --privileged
-       or  --security-opt seccomp=unconfined --security-opt apparmor=unconfined
-  RunPod:  Edit Pod -> extra flags -> --privileged, then Start
-  Baseten: request a privileged / unconfined-seccomp workstation
-
-Then `bash scripts/setup_tau2_sandbox.sh` should print bwrap: ok and srt-ok.
-BM25 / dense search still work without this; only the sandboxed shell is dead.
-""".strip()
-
-
-class SandboxNamespaceError(RuntimeError):
-    """Banking `shell` cannot run: binaries missing, or namespaces blocked."""
-
-
-def assert_sandbox_ready(domains: list[str]) -> None:
-    """Fail loud before a tau2 run if banking shell cannot actually execute.
-
-    Skip when banking is not in `domains`, and on macOS (sandbox-exec, not bwrap).
-    """
-    if "banking_knowledge" not in domains:
-        artifact_event(
-            "sandbox",
-            "sandbox_preflight_skipped",
-            domains=domains,
-            reason="banking_knowledge_not_requested",
-        )
-        return
-    if sys.platform == "darwin":
-        logger.info("tau2 sandbox: macOS uses sandbox-exec; skipping Linux namespace probe")
-        artifact_event(
-            "sandbox",
-            "sandbox_preflight_skipped",
-            domains=domains,
-            platform=sys.platform,
-            reason="macos_uses_sandbox_exec",
-        )
-        return
-    resolved = {name: shutil.which(name) for name in _SANDBOX_BINS}
-    missing = [name for name, path in resolved.items() if path is None]
-    artifact_event(
-        "sandbox",
-        "sandbox_preflight_started",
-        domains=domains,
-        platform=sys.platform,
-        binaries=resolved,
-        probes=[list(_BWRAP_PROBE), list(_SRT_PROBE)],
-    )
-    if missing:
-        artifact_event(
-            "sandbox",
-            "sandbox_preflight_failed",
-            cause="missing_binaries",
-            missing=missing,
-            binaries=resolved,
-        )
-        raise SandboxNamespaceError(
-            "tau2 banking sandbox binaries missing from PATH: "
-            f"{missing}. Run: bash scripts/setup_tau2_sandbox.sh"
-        )
-    try:
-        proc = subprocess.run(
-            _BWRAP_PROBE, capture_output=True, text=True, timeout=10
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        artifact_event(
-            "sandbox",
-            "sandbox_preflight_failed",
-            cause="probe_exception",
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
-        raise SandboxNamespaceError(
-            f"bwrap namespace probe could not run: {exc}\n\n{SANDBOX_NAMESPACE_HINT}"
-        ) from exc
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        artifact_event(
-            "sandbox",
-            "sandbox_preflight_failed",
-            cause="namespace_probe_failed",
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-        )
-        raise SandboxNamespaceError(
-            f"bwrap namespace probe failed (exit {proc.returncode}): {err}\n\n"
-            f"{SANDBOX_NAMESPACE_HINT}"
-        )
-    logger.info("tau2 sandbox: bwrap namespace probe ok")
-
-    try:
-        srt_proc = subprocess.run(
-            _SRT_PROBE, capture_output=True, text=True, timeout=15
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        artifact_event(
-            "sandbox",
-            "sandbox_preflight_failed",
-            cause="srt_probe_exception",
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
-        raise SandboxNamespaceError(
-            f"srt end-to-end probe could not run: {exc}\n\n{SANDBOX_NAMESPACE_HINT}"
-        ) from exc
-    if srt_proc.returncode != 0 or "srt-ok" not in (srt_proc.stdout or ""):
-        err = (srt_proc.stderr or srt_proc.stdout or "").strip()
-        artifact_event(
-            "sandbox",
-            "sandbox_preflight_failed",
-            cause="srt_probe_failed",
-            returncode=srt_proc.returncode,
-            stdout=srt_proc.stdout,
-            stderr=srt_proc.stderr,
-        )
-        raise SandboxNamespaceError(
-            f"srt end-to-end probe failed (exit {srt_proc.returncode}): {err}\n\n"
-            f"{SANDBOX_NAMESPACE_HINT}"
-        )
-    logger.info("tau2 sandbox: srt end-to-end probe ok")
-    artifact_event(
-        "sandbox",
-        "sandbox_preflight_succeeded",
-        bwrap={
-            "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-        },
-        srt={
-            "returncode": srt_proc.returncode,
-            "stdout": srt_proc.stdout,
-            "stderr": srt_proc.stderr,
-        },
-    )
 
 DEFAULT_GREETING = "Hi! How can I help you today?"
 AGENT_STOP_TOKEN = "###STOP###"
@@ -339,31 +178,9 @@ def format_transcript(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def env_kwargs_for(task: Task, retrieval: str = "alltools-qwen") -> dict:
-    if task.domain == "banking_knowledge":
-        return {
-            "solo_mode": False,
-            "retrieval_variant": retrieval,
-            "task": task.tau2_task,
-        }
+def env_kwargs_for(task: Task) -> dict:
+    del task
     return {"solo_mode": False}
-
-
-def configure_embeddings_cache(cache_dir: str | None = None) -> None:
-    """Point tau2's EmbeddingsCache at `/workspace` on RunPod so dense retrieval survives restarts."""
-    if cache_dir is None:
-        cache_dir = (
-            "/workspace/.embeddings_cache" if os.path.isdir("/workspace") else None
-        )
-    if not cache_dir:
-        return
-    os.makedirs(cache_dir, exist_ok=True)
-    try:
-        from tau2.knowledge import embeddings_cache as ec
-    except ImportError:
-        return
-    ec._global_cache = ec.EmbeddingsCache(cache_dir=cache_dir)
-    logger.info("tau2 embeddings cache: %s", cache_dir)
 
 
 def openai_tool_schemas(env) -> list[dict]:
@@ -381,16 +198,10 @@ def openai_tool_schemas(env) -> list[dict]:
 
 
 def gold_material(task: Task) -> str:
-    """Sierra-authored answer key: gold KB docs (banking) or canonical actions (retail/airline)."""
+    """Canonical tool actions from the tau2 evaluation criteria."""
     tau = task.tau2_task
     if tau is None:
         return ""
-    if task.domain == "banking_knowledge":
-        titles = list(getattr(tau, "required_documents", None) or [])
-        if not titles:
-            return "(no gold documents listed)"
-        bodies = _load_kb_docs(titles)
-        return "\n\n".join(bodies) if bodies else "(no gold documents listed)"
     criteria = getattr(tau, "evaluation_criteria", None)
     actions = (criteria.actions if criteria is not None else None) or []
     lines = [a.get_func_format() for a in actions]
@@ -401,43 +212,21 @@ def gold_suffix(task: Task) -> str:
     """Teacher-context dump. The trainer prepends HINT_SEPARATOR; do not include it here."""
     if task.tau2_task is None:
         return ""
-    if task.domain == "banking_knowledge":
-        return f"Gold knowledge for this task:\n{gold_material(task)}"
     return f"Canonical tool trajectory:\n{gold_material(task)}"
 
 
-def _load_kb_docs(titles: list[str]) -> list[str]:
-    try:
-        from tau2.domains.banking_knowledge.environment import get_knowledge_base
-    except ImportError:
-        return [f"(knowledge extra not installed; cannot load {t})" for t in titles]
-    kb = get_knowledge_base()
-    docs = list(kb.get_all_documents())
-    title_to_doc = {doc.title: doc for doc in docs}
-    id_to_doc = {doc.id: doc for doc in docs}
-    out: list[str] = []
-    for ref in titles:
-        doc = title_to_doc.get(ref) or id_to_doc.get(ref)
-        if doc is None:
-            logger.warning("required document not in KB: %s", ref)
-            continue
-        out.append(f"## {doc.title}\n\n{doc.content}")
-    return out
-
-
-def make_env(task: Task, retrieval: str = "alltools-qwen"):
+def make_env(task: Task):
     from tau2.registry import registry
 
     if task.domain is None or task.tau2_task is None:
         raise ValueError(f"{task.task_id} is not a tau2 task")
     started = time.monotonic()
-    kwargs = env_kwargs_for(task, retrieval)
+    kwargs = env_kwargs_for(task)
     artifact_event(
         "sandbox",
         "tau2_environment_build_started",
         task_id=task.task_id,
         domain=task.domain,
-        retrieval=retrieval,
         env_kwargs=kwargs,
     )
     try:
@@ -467,7 +256,6 @@ def make_env(task: Task, retrieval: str = "alltools-qwen"):
             "tau2_environment_build_failed",
             task_id=task.task_id,
             domain=task.domain,
-            retrieval=retrieval,
             elapsed_seconds=time.monotonic() - started,
             error_type=type(exc).__name__,
             error=str(exc),
@@ -478,7 +266,6 @@ def make_env(task: Task, retrieval: str = "alltools-qwen"):
         "tau2_environment_build_succeeded",
         task_id=task.task_id,
         domain=task.domain,
-        retrieval=retrieval,
         elapsed_seconds=time.monotonic() - started,
         tool_count=len(openai_tool_schemas(env)),
     )
@@ -508,7 +295,7 @@ def default_user_llm_args() -> dict:
     }
 
 
-def evaluate_episode(task: Task, tau_messages: list, termination: str, retrieval: str) -> float:
+def evaluate_episode(task: Task, tau_messages: list, termination: str) -> float:
     from tau2.data_model.simulation import SimulationRun, TerminationReason
     from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
     from tau2.utils.utils import get_now
@@ -534,7 +321,7 @@ def evaluate_episode(task: Task, tau_messages: list, termination: str, retrieval
         solo_mode=False,
         domain=task.domain,
         env_kwargs={
-            k: v for k, v in env_kwargs_for(task, retrieval).items() if k != "solo_mode"
+            k: v for k, v in env_kwargs_for(task).items() if k != "solo_mode"
         },
     )
     return float(info.reward)
@@ -733,7 +520,6 @@ async def run_tau2_episode(
     encode: Callable[[str], list[int]],
     tokenize_chat: Callable[[list[dict], list[dict] | None], list[int]],
     user_llm: str,
-    retrieval: str = "alltools-qwen",
     max_steps: int = 30,
     user_llm_args: dict | None = None,
 ) -> EpisodeResult:
@@ -741,7 +527,7 @@ async def run_tau2_episode(
     from tau2.data_model.message import AssistantMessage, ToolCall
     from tau2.user.user_simulator import UserSimulator
 
-    env = make_env(task, retrieval=retrieval)
+    env = make_env(task)
     user = make_user(task, llm=user_llm, llm_args=user_llm_args, env=env)
     user_state = user.get_init_state()
     tools = openai_tool_schemas(env)
@@ -833,7 +619,6 @@ async def run_tau2_episode(
         return content
 
     async def _generate(messages: list[dict], tool_schemas: list[dict] | None) -> AgentTurn:
-        # Discoverable banking tools can appear mid-episode.
         current = openai_tool_schemas(env) or tool_schemas
         return await generate_turn(messages, current)
 
@@ -863,14 +648,13 @@ async def run_tau2_episode(
     episode.tau_messages = _to_tau_messages(episode.messages)
     evaluation_started = time.monotonic()
     try:
-        # evaluate_simulation is sync and can reconstruct an env (banking
-        # sandbox). Running it on the event loop freezes get_batch / timeouts.
+        # evaluate_simulation is sync. Running it on the event loop freezes
+        # get_batch / timeouts.
         episode.reward = await asyncio.to_thread(
             evaluate_episode,
             task,
             episode.tau_messages,
             episode.termination,
-            retrieval,
         )
     except Exception as exc:
         logger.exception("tau2 evaluate_simulation failed for %s", task.task_id)

@@ -21,5 +21,5 @@ runs/
 # tau2-bench sparse clone (pip does not ship data/; clone locally, do not vendor)
 .deps/
 
-# sandbox-runtime is a Node CLI; install via scripts/setup_tau2_sandbox.sh
+# leftover npm installs from the removed banking sandbox helper
 node_modules/

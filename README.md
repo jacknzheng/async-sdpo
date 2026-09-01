@@ -4,7 +4,7 @@ A reproduction of the training setup from Trajectory's field report
 [Scaling SDPO](https://trajectory.ai/field-notes/scaling-sdpo), applied to two
 tool-using evals:
 
-- **tau2** (default) — Sierra `banking_knowledge` + `retail` + `airline`. Multi-turn
+- **tau2** (default) — Sierra `retail` + `airline`. Multi-turn
   TIR with a user simulator; held-out metric is pass^1.
 - **DiligenceBench** — [`paperinstruments/diligence-bench`](https://huggingface.co/datasets/paperinstruments/diligence-bench).
   Multi-turn TIR with Parallel `web_search`, scored by a rubric judge (eval only).
@@ -100,34 +100,12 @@ PARALLEL_API_KEY=...     # diligence web_search only
 ### Install
 
 ```bash
-uv sync --extra knowledge          # tau2 + banking retrieval; also enough for diligence
-bash scripts/setup_tau2_sandbox.sh # banking_knowledge shell tool; skip only if you will
-                                   # never touch banking. This script *probes namespaces*,
-                                   # not just `which`.
+uv sync --extra tau2               # retail + airline; also enough for diligence tests
 uv run pytest tests/ -q            # offline; no GPU
 ```
 
-`setup_tau2_sandbox.sh` installs `@anthropic-ai/sandbox-runtime@0.0.23` plus
-`ripgrep`, `bubblewrap`, `socat`. Retail and airline do not need this.
-
-**Known failure: `which` is a false green.** tau2 only checks that `srt` / `rg` /
-`bwrap` / `socat` exist on PATH, so env construction succeeds. The banking `shell`
-tool then runs inside `srt` → `bwrap` → `unshare`. GPU pods (RunPod / Baseten /
-default Docker) often install those binaries but **seccomp-block nested namespaces**.
-Every shell call then fails at runtime with:
-
-```
-bwrap: Creating new namespace failed: Operation not permitted
-```
-
-That is container policy, not a missing package. Recreate the pod/container with
-`--privileged`, or `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`.
-On RunPod: Edit Pod → extra flags → `--privileged`, then Start. On Baseten: request a
-privileged / unconfined-seccomp workstation. Confirm with
-`bwrap --ro-bind / / --dev /dev /bin/echo bwrap-ok` and `srt -c 'echo srt-ok'`.
-`run.py` runs this probe at tau2 startup and exits if it fails — do not train through
-a fleet of zero-reward banking episodes. BM25 / dense search still work; only shell
-is dead. Treat `gold_banking` as the canary before the three-domain `gold` run.
+Retail and airline talk to in-process database tools. There is no host sandbox
+and no `--privileged` requirement.
 
 ### Launch
 
@@ -143,7 +121,6 @@ bash scripts/run_diligencebench.sh baseline
 # Training ablations (one 8-GPU box per arm is the intended fleet).
 bash scripts/run_taubench.sh gold
 bash scripts/run_taubench.sh step_hint
-bash scripts/run_taubench.sh gold_banking
 
 bash scripts/run_diligencebench.sh answer_free
 bash scripts/run_diligencebench.sh answer_bearing
@@ -160,8 +137,7 @@ context, per-task held-out outputs and scores, complete episodes, tool
 activity, per-step metrics, and generation lifecycles. Evaluation blocks
 training at each `judge.eval_interval` boundary (25 steps by default), so an
 evaluation is neither skipped nor mislabeled after later weight updates.
-`scripts/setup_tau2_sandbox.sh` also writes a timestamped
-`tau2-sandbox-setup-*.log`. Checkpoints go to `runs/sdpo-tau2/` or
+Checkpoints go to `runs/sdpo-tau2/` or
 `runs/sdpo-diligence/`. Wandb projects: `sdpo-tau2` / `sdpo-diligence`. Each
 train step also logs a `samples` table (prompt, output, both hint arms).
 
@@ -210,14 +186,13 @@ If training misbehaves, `trainer.compile_trainer=false` is the first debug lever
 
 | Mode           | Teacher hint                                      | Notes                                      |
 | -------------- | ------------------------------------------------- | ------------------------------------------ |
-| `gold`         | Sierra gold docs / canonical tool trajectory      | Main arm. No hint LLM. Cheap.              |
+| `gold`         | Canonical tool trajectory                         | Main arm. No hint LLM. Cheap.              |
 | `step_hint`    | OpenRouter DeepSeek names the single next action | Gold + transcript in, one action out.    |
-| `gold_banking` | Same as `gold`, `banking_knowledge` only          | Sandbox-stress arm.                        |
-| `baseline`     | n/a                                               | Zero-shot pass^1 on ~87 held-out tasks.    |
+| `baseline`     | n/a                                               | Zero-shot pass^1 on the official test split. |
 | `smoke`        | gold, tiny model                                  | Sanity check.                              |
 
 Eval metric: `pass1` overall and per domain. Binary, so eval "reward variance" is low by
-construction. A fleet of zeros on banking is almost always the sandbox, not the loss.
+construction.
 
 ### Diligence (`scripts/run_diligencebench.sh`)
 
@@ -305,7 +280,7 @@ actually produced. Tau2 user-sim is the same DeepSeek slug
 `nvidia/nemotron-3-super-120b-a12b:free`. Set `generator.hint.backend=vllm` to
 run a frozen local hinter instead.
 Two rollouts of the same task get different hints. Tau2 `gold` skips the LLM and injects
-Sierra gold / the canonical tool trajectory instead.
+the canonical tool trajectory instead.
 
 Hint and judge requests disable model reasoning (`effort: none`) so thinking
 cannot eat the output budget. Independently configurable through
@@ -328,28 +303,18 @@ During a real run, in order:
 1. **Teacher−student gap is clearly nonzero.** `trainer.py` logs
    `teacher_minus_student_logp` every step and warns when `|gap| < 1e-3`. That is a dead
    gradient. Typical causes: hint too timid (`answer_free`), hint LLM failing / empty,
-   gold suffix not actually landing, sandbox producing empty transcripts, SOD + loss mask
+   gold suffix not actually landing, empty transcripts, SOD + loss mask
    eating every token. Stronger teacher = `answer_bearing` / `gold`; do **not** add
    GRPO-style whitening or a baseline term.
 2. **Clip fractions are a modest minority of tokens.** All-clipped means the off-policy
    correction is a no-op; all-unclipped with exploding ratios is the failure the clips
    exist to prevent.
-3. **Staleness ≤ 3.** If the store is starving, rollout is too slow (sandbox, search,
+3. **Staleness ≤ 3.** If the store is starving, rollout is too slow (search,
    OpenRouter) or too many hints are dropping. A freeze after ~K steps with GPUs at 0%
    is the producer/consumer deadlock: the staleness manager must admit `batch_size`
    groups per step, not `mini_batch_size`. That is wired in `AsyncStalenessManager`.
 4. **Held-out metric beats the zero-shot baseline.** Tau2: `pass1`. Diligence:
    `judge_score` plus `factual-accuracy` / `analytical-reasoning` / `risk-awareness`.
-
-**Sandbox.** Two different failures, do not mix them up:
-
-1. **Missing binaries** (`srt` / `rg` / `bwrap` / `socat`) — `SandboxRuntimeError` at
-   env construction. Run `bash scripts/setup_tau2_sandbox.sh`.
-2. **Namespaces blocked** (the usual GPU-pod case) — binaries exist, `which` is green,
-   then `bwrap: Creating new namespace failed: Operation not permitted`. Recreate the
-   pod `--privileged` / `seccomp=unconfined`. `run.py` probes this at startup and
-   exits. Until the pod is recreated, isolate banking (`gold_banking`) rather than
-   taking down the three-domain `gold` run; BM25/dense still work.
 
 **Do not** flip the SDPO sign, change the clip window to exclude 1.0, filter
 zero-variance groups (`group_size=1`, `keep_failures=True` is the blog finding), or
@@ -455,7 +420,7 @@ Written against **vLLM 0.26.x — pin it exactly.** The native weight-transfer A
 
 | Blog                              | Here                                     | Why                            |
 | ---------------------------------- | ---------------------------------------- | ------------------------------ |
-| Tau-Retail only                    | tau2 (banking+retail+airline) + diligence | both requested                 |
+| Tau-Retail only                    | tau2 (retail+airline) + diligence         | both requested                 |
 | Qwen3-8B DDP                       | Qwen3.8-27B FSDP2                        | 27B does not fit per-rank      |
 | symmetric PPO clip ε=0.2           | DAPO decoupled 0.8 / 1.4                 | requested                      |
 | hint = canonical answer            | gold / step_hint / answer_free|bearing   | per-dataset ablations          |

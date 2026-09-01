@@ -285,16 +285,15 @@ class TrainerConfig(BaseConfig):
 
 @dataclass(frozen=True)
 class DataConfig(BaseConfig):
-    # "tau2" (banking_knowledge + retail + airline) or "diligence".
+    # "tau2" (retail + airline) or "diligence".
     dataset: str = "tau2"
     dataset_name: str = "paperinstruments/diligence-bench"
     dataset_split: str = "test"
-    domains: list[str] = field(default_factory=lambda: ["banking_knowledge", "retail", "airline"])
-    # Banking has no official split -- carve this many held-out of 97. Diligence
-    # tests pass n_heldout=30 explicitly; set data.n_heldout=30 when dataset=diligence.
-    n_heldout: int = 27
+    domains: list[str] = field(default_factory=lambda: ["retail", "airline"])
+    # Diligence has no official split -- carve this many held-out of 150.
+    # Tau2 uses Sierra's train/test loaders and ignores this field.
+    n_heldout: int = 30
     split_seed: int = 0
-    retrieval: str = "alltools-qwen"
     user_llm: str = "openrouter/deepseek/deepseek-v4-flash"
     # Parallel Search (diligence TIR only). https://docs.parallel.ai/search/search-quickstart
     search_mode: str = "fast"
@@ -304,9 +303,10 @@ class DataConfig(BaseConfig):
     def __post_init__(self) -> None:
         if self.dataset not in ("tau2", "diligence"):
             raise ValueError(f"data.dataset must be 'tau2' or 'diligence', got {self.dataset!r}")
-        if self.retrieval != "alltools-qwen":
+        unknown = [d for d in self.domains if d not in ("retail", "airline")]
+        if unknown:
             raise ValueError(
-                f"data.retrieval must be 'alltools-qwen' (Qwen embeddings); got {self.retrieval!r}"
+                f"data.domains must be retail and/or airline; got {unknown}"
             )
         if self.search_mode not in ("turbo", "fast", "basic", "advanced"):
             raise ValueError(

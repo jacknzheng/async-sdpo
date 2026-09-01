@@ -127,7 +127,7 @@ def setup_run_logging(
                     "api_failures.jsonl    OpenRouter, Parallel, judge, and user-sim failures",
                     "evaluations.jsonl     per-task eval outputs, scores, errors, and aggregates",
                     "rollouts.jsonl        complete messages, transcripts, hints, and outcomes",
-                    "sandbox.jsonl         tau2 preflight, environment, tool, and scoring events",
+                    "sandbox.jsonl         tau2 environment, tool, and scoring events",
                     "training.jsonl        per-step metrics, task IDs, and policy versions",
                     "vllm.jsonl            engine and generation request lifecycle events",
                     "",

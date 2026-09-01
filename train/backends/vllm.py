@@ -608,7 +608,6 @@ class VLLMRolloutEngine(InferenceEngine):
                 tokenize_chat=self.tokenize_chat,
                 user_llm=self.config.data.user_llm,
                 user_llm_args=default_user_llm_args(),
-                retrieval=self.config.data.retrieval,
                 max_steps=self.config.generator.max_steps,
             )
             text = episode.transcript
